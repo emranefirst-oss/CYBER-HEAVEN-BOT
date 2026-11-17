@@ -219,15 +219,8 @@ class CyberBot(commands.Bot):
         init_db()
         if not GUILD_IDS:
             raise RuntimeError("Set GUILD_IDS in Railway Variables (comma-separated server IDs).")
-        for guild_id in sorted(GUILD_IDS):
-            guild = discord.Object(id=guild_id)
-            # Remove stale guild-only command definitions before copying the
-            # current global definitions. This repairs Discord-side signature
-            # mismatches (for example, an older /announce option list).
-            self.tree.clear_commands(guild=guild)
-            self.tree.copy_global_to(guild=guild)
-            synced = await self.tree.sync(guild=guild)
-            log.info("Force-synced %s slash commands to guild %s", len(synced), guild_id)
+        # Sync after the gateway is ready in on_ready. This avoids relying on
+        # stale Discord-side command definitions from previous deployments.
         voice_xp_loop.start()
 
 
@@ -241,9 +234,35 @@ intents.voice_states = True
 bot = CyberBot(command_prefix=commands.when_mentioned, intents=intents)
 
 
+_commands_synced = False
+
 @bot.event
 async def on_ready():
+    global _commands_synced
     log.info("Logged in as %s", bot.user)
+
+    # Rebuild each guild's remote slash-command list from the current code.
+    # Deleting remote entries first prevents old option signatures from
+    # remaining attached to /announce, /send, or other commands.
+    if not _commands_synced:
+        for guild_id in sorted(GUILD_IDS):
+            guild = discord.Object(id=guild_id)
+            try:
+                remote_commands = await bot.tree.fetch_commands(guild=guild)
+                for remote_command in remote_commands:
+                    await remote_command.delete()
+                bot.tree.clear_commands(guild=guild)
+                bot.tree.copy_global_to(guild=guild)
+                synced = await bot.tree.sync(guild=guild)
+                log.info(
+                    "Rebuilt slash commands for guild %s: %s commands",
+                    guild_id, len(synced)
+                )
+            except discord.HTTPException:
+                log.exception("Could not rebuild slash commands for guild %s", guild_id)
+                raise
+        _commands_synced = True
+
     if setting("voice_24_7") == "1":
         await reconnect_saved_voice()
 
@@ -875,6 +894,16 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
         message = str(error) or "Ma 3ndkch permission l had command."
     elif isinstance(error, app_commands.MissingPermissions):
         message = "Ma 3ndkch permissions kafiin l had command."
+    elif isinstance(error, app_commands.CommandSignatureMismatch):
+        log.warning(
+            "Discord sent stale options for /%s. Guild=%s. Commands were rebuilt on startup.",
+            interaction.command.name if interaction.command else "unknown",
+            interaction.guild_id,
+        )
+        message = (
+            "Discord mazal kayst3mel version 9dima dyal had command. "
+            "Sedd Discord w 3awd 7ello, w 3awd jarrab mn ba3d chwia."
+        )
     else:
         log.exception("Slash command error", exc_info=error)
         message = "Twa9e3 error. T9yd f logs dyal bot."
