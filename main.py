@@ -1134,6 +1134,66 @@ async def set_embed_color_cmd(i: discord.Interaction, color: str):
     PINK = parse_color(color)
     await rep(i, embed=emb(f"Lon daba: **{color}**"), ephemeral=True)
 
+import discord
+from discord.ext import commands
+import json
+import random
+import os
+
+bot = commands.Bot(command_prefix="!", intents=discord.Intents.all())
+
+# --- اللوت هو هو لكلشي ---
+LOOT = [
+    "🗡️ سيف أسطوري",
+    "🛡️ درع ذهبي",
+    "💎 جوهرة نادرة",
+    "🧪 جرعة سحرية",
+    "🏹 قوس الصياد",
+    "💰 1000 كوينز"
+]
+
+# --- ملف التصاور ---
+FILE = "server_images.json"
+
+def load_images():
+    if not os.path.exists(FILE):
+        return {}
+    with open(FILE, "r") as f:
+        return json.load(f)
+
+def save_images(data):
+    with open(FILE, "w") as f:
+        json.dump(data, f, indent=4)
+
+# تصويرة افتراضية إلا السيرفر مازال ما حطش ديالو
+DEFAULT_IMAGE = "https://i.imgur.com/EXEMPLE.png"
+
+@bot.command()
+async def loot(ctx):
+    item = random.choice(LOOT)
+    images = load_images()
+    # كنجيبو التصويرة ديال هاد السيرفر بالضبط
+    image_url = images.get(str(ctx.guild.id), DEFAULT_IMAGE)
+
+    embed = discord.Embed(title="🎁 اللوت ديالك!", description=f"ربحتي: **{item}**", color=0xFFD700)
+    embed.set_image(url=image_url)
+    embed.set_footer(text=f"سيرفر: {ctx.guild.name}")
+    await ctx.send(embed=embed)
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def setimage(ctx, link: str):
+    images = load_images()
+    images[str(ctx.guild.id)] = link
+    save_images(images)
+    await ctx.send(f"✅ صافي، التصويرة ديال هاد السيرفر تبدلات!\n{link}")
+
+@bot.command()
+async def myimage(ctx):
+    images = load_images()
+    image_url = images.get(str(ctx.guild.id), DEFAULT_IMAGE)
+    await ctx.send(f"التصويرة ديال هاد السيرفر هي:\n{image_url}")
+
 
 TOKEN = os.getenv("TOKEN")
 if not TOKEN:
