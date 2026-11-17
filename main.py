@@ -221,9 +221,13 @@ class CyberBot(commands.Bot):
             raise RuntimeError("Set GUILD_IDS in Railway Variables (comma-separated server IDs).")
         for guild_id in sorted(GUILD_IDS):
             guild = discord.Object(id=guild_id)
+            # Remove stale guild-only command definitions before copying the
+            # current global definitions. This repairs Discord-side signature
+            # mismatches (for example, an older /announce option list).
+            self.tree.clear_commands(guild=guild)
             self.tree.copy_global_to(guild=guild)
             synced = await self.tree.sync(guild=guild)
-            log.info("Synced %s slash commands to guild %s", len(synced), guild_id)
+            log.info("Force-synced %s slash commands to guild %s", len(synced), guild_id)
         voice_xp_loop.start()
 
 
