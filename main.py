@@ -1,1205 +1,884 @@
-
 import os
 import random
-import re
+import sqlite3
 import time
-import asyncio
-from collections import Counter, defaultdict, deque
-from datetime import datetime, timedelta, timezone
-from typing import Literal
+import logging
+from datetime import datetime, timezone, date, timedelta
 
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 
+# CYBER HEAVEN - single-server Discord bot
+TOKEN = os.getenv("TOKEN")
+GUILD_ID = int(os.getenv("GUILD_ID", "0"))
 OWNER_ID = 1396590553420005437
+DB_PATH = os.getenv("DB_PATH", "cyber_heaven.db")
 
-# FULL CONTROL - Announce / Send - 100% editable from Discord
-# /set_title, /set_footer, /set_server_name, /set_embed_color, /announce, /send
-# Kolchi kaytbedel mn Discord, 0% hardcoded
-ANNOUNCE_CFG = {"title": "CYBER HEAVEN", "footer": "CYBER HEAVEN - Welcome to the family", "server_name": "CYBER HEAVEN", "color": 0xe66cb6}
-  # Ghir Emrane li kay7kem f bot f ay server
-PINK = 0xe66cb6
-TITLE = "CYBER HEAVEN"
-FOOTER = "CYBER HEAVEN - Welcome to the family"
-MAIN_IMAGE = "https://cdn.discordapp.com/attachments/1522319156614266890/1570902791667322960/903307255_1448823723986247_5560795212911455220_n.webp?ex=6af8c8bb&is=6af7773b&hm=c6365483f51bf48ef0afe790a2a3990236c2b6f702aa456835c80461f477224e&"
-WELCOME_CHANNEL_ID = 1569130814355021915
-RULES_CHANNEL_ID = 1510457472471535767
-LEVEL_UP_CHANNEL_ID = 1568227584376836137
+DEFAULTS = {
+    "server_name": "CYBER HEAVEN",
+    "embed_color": 0xE66CB6,
+    "embed_title": "CYBER HEAVEN",
+    "footer": "CYBER HEAVEN - Welcome to the family",
+    "level_channel": 0,
+    "welcome_channel": 0,
+    "rules_channel": 0,
+    "log_channel": 0,
+    "rules_text": "1. Respect everyone.\n2. No drama.\n3. No spam, ads or unsolicited invites.\n4. Keep language respectful.\n5. Use each channel for its intended topic.\n6. No NSFW content.\n7. Follow staff instructions.\n8. Enjoy the community.",
+    "welcome_text": "Mar7ba bik f {server}, {user}! Ntmnaw lik wa9t zwine m3ana.",
+    "xp_min": 5,
+    "xp_max": 15,
+    "voice_xp": 50,
+    "daily_min": 100,
+    "daily_max": 300,
+    "level_roles": "1:Newcomer,5:Active,10:Elite,20:Legend,30:Mythic",
+    "auto_role": 0,
+    "voice_channel": 0,
+    "voice_24_7": 0,
+}
 
-RULES = [
-    "1. Respect kolchi, hna 3a2ila wa7da.",
-    "2. No drama: ay mochkil kan7elouh b hdou2 f ticket.",
-    "3. Bla spam, bla pub, bla invites.",
-    "4. Bla alfaz khayba, 3onsoriya awla ihana.",
-    "5. Kol channel w mawdou3o.",
-    "6. Mamnou3 NSFW w ay content ma mnasbch.",
-    "7. Sma3 l staff, 9rarathom nihaiya.",
-    "8. Tsalya, l3ab, w 3ich f jaw dial l 3a2ila!",
-]
-LEVEL_ROLES = {1: "Newcomer", 5: "Active", 10: "Elite", 20: "Legend", 30: "Mythic"}  # 5 ranks only, NO VIP
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("cyber-heaven")
 
-intents = discord.Intents.default()
-intents.message_content = True
-intents.members = True
-intents.presences = True
-bot = commands.Bot(command_prefix=commands.when_mentioned, intents=intents, help_command=None)
-START = datetime.now(timezone.utc)
 
-users = {}
-afk = {}
-cfg = {"log": None, "starboard": None, "suggest": None, "staff": None, "level_channel": 1568227584376836137, "welcome_channel": 1569130814355021915, "rules_channel": 1510457472471535767, "voice_channel": None, "voice_247": False}
-counting = {"channel": None, "current": 0}
-tickets = {}
-starred = set()
-sent_ids = set()
-replied = set()
-public_def = set()
-cooldowns = {}
-spam = defaultdict(lambda: deque(maxlen=10))
-xp_cd = {}
-synced = False
-INVITE_RE = re.compile(r"(discord\.gg|discord(app)?\.com/invite)/\w+", re.I)
+def db():
+    connection = sqlite3.connect(DB_PATH)
+    connection.row_factory = sqlite3.Row
+    return connection
 
-def U(uid):
-    if uid not in users:
-        users[uid] = dict(money=500, bank=0, xp=0, level=1, streak=0, daily=None, inv=[], job=None, warns=[], work_last=0.0, rob_last=0.0, boost=0.0, rps=[0,0,0])
-    return users[uid]
 
-def need(level):
+def init_db():
+    with db() as con:
+        con.executescript("""
+        CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS users (
+            guild_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
+            xp INTEGER NOT NULL DEFAULT 0, level INTEGER NOT NULL DEFAULT 0,
+            wallet INTEGER NOT NULL DEFAULT 0, bank INTEGER NOT NULL DEFAULT 0,
+            last_daily TEXT, daily_streak INTEGER NOT NULL DEFAULT 0,
+            warnings INTEGER NOT NULL DEFAULT 0, messages INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (guild_id, user_id)
+        );
+        CREATE TABLE IF NOT EXISTS warnings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, guild_id INTEGER,
+            user_id INTEGER, moderator_id INTEGER, reason TEXT, created_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS shop (
+            item TEXT PRIMARY KEY, price INTEGER NOT NULL, description TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS inventory (
+            guild_id INTEGER, user_id INTEGER, item TEXT, quantity INTEGER DEFAULT 0,
+            PRIMARY KEY (guild_id, user_id, item)
+        );
+        CREATE TABLE IF NOT EXISTS tickets (
+            channel_id INTEGER PRIMARY KEY, guild_id INTEGER, user_id INTEGER,
+            status TEXT DEFAULT 'open', created_at TEXT
+        );
+        """)
+        for key, value in DEFAULTS.items():
+            con.execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)", (key, str(value)))
+        starter_items = [
+            ("Color", 500, "Cosmetic shop item."),
+            ("XPBoost", 1000, "A future XP boost item."),
+            ("Shield", 750, "A future protection item."),
+        ]
+        for item in starter_items:
+            con.execute("INSERT OR IGNORE INTO shop(item,price,description) VALUES(?,?,?)", item)
+
+
+def setting(key):
+    with db() as con:
+        row = con.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+    return row["value"] if row else str(DEFAULTS.get(key, ""))
+
+
+def set_setting(key, value):
+    with db() as con:
+        con.execute(
+            "INSERT INTO settings(key,value) VALUES(?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, str(value))
+        )
+
+
+def ensure_user(guild_id, user_id):
+    with db() as con:
+        con.execute(
+            "INSERT OR IGNORE INTO users(guild_id,user_id) VALUES(?,?)",
+            (guild_id, user_id)
+        )
+
+
+def get_user(guild_id, user_id):
+    ensure_user(guild_id, user_id)
+    with db() as con:
+        return con.execute(
+            "SELECT * FROM users WHERE guild_id=? AND user_id=?",
+            (guild_id, user_id)
+        ).fetchone()
+
+
+def need_xp(level):
     return 100 + level * 40
 
-def total_xp(u):
-    return sum(need(l) for l in range(1, u["level"])) + u["xp"]
 
-def bar(cur, tot, n=10):
-    tot = max(tot, 1)
-    f = int(n * min(cur, tot) / tot)
-    return "█" * f + "░" * (n - f)
+def make_embed(title=None, description=None):
+    color = int(setting("embed_color"))
+    embed = discord.Embed(
+        title=title or setting("embed_title"),
+        description=description,
+        color=color,
+        timestamp=datetime.now(timezone.utc)
+    )
+    embed.set_footer(text=setting("footer"))
+    return embed
 
-def fmt(n):
-    return f"{n:,}"
 
-def now():
-    return datetime.now(timezone.utc)
-
-def rank_of(uid):
-    ordered = sorted(users, key=lambda k: (users[k]["level"], users[k]["xp"]), reverse=True)
-    return (ordered.index(uid) + 1 if uid in ordered else len(ordered) + 1), max(len(ordered), 1)
-
-def emb(desc=None, *, title=TITLE, color=PINK, fields=None, image=None, thumb=None, author=None):
-    e = discord.Embed(title=title, description=desc, color=color)
-    for f in (fields or []):
-        e.add_field(name=f[0], value=f[1], inline=(f[2] if len(f) > 2 else True))
-    if image:
-        e.set_image(url=image)
-    if thumb:
-        e.set_thumbnail(url=thumb)
-    if author:
-        e.set_author(name=author[0], icon_url=author[1])
-    e.set_footer(text=FOOTER)
-    return e
-
-def parse_color(s):
-    try:
-        s = (s or "").strip().lstrip("#")
-        if s.lower().startswith("0x"):
-            s = s[2:]
-        v = int(s, 16)
-        return v if 0 <= v <= 0xFFFFFF else PINK
-    except Exception:
-        return PINK
-
-def is_staff(m):
-    p = m.guild_permissions
-    return p.administrator or p.manage_messages or p.manage_guild
-
-async def rep(i, content=None, *, embed=None, view=None, ephemeral=False):
-    replied.add(i.id)
-    kw = {}
-    if content:
-        kw["content"] = content
-    if embed is not None:
-        kw["embed"] = embed
-    if view is not None:
-        kw["view"] = view
-    return await i.followup.send(ephemeral=ephemeral, **kw)
-
-async def fail(i, text):
-    if i.id in public_def:
-        public_def.discard(i.id)
-        try:
-            await i.delete_original_response()
-        except Exception:
-            pass
-    replied.add(i.id)
-    await i.followup.send(embed=emb(text), ephemeral=True)
-
-def safe(eph=False, perm=None, owner=False, cd=True):
-    def deco(fn):
-        name = fn.__name__
-        import functools
-        @functools.wraps(fn)
-        async def wrapper(interaction, *args, **kwargs):
-            try:
-                if interaction.id in sent_ids:
-                    return
-                sent_ids.add(interaction.id)
-                if len(sent_ids) > 10000:
-                    sent_ids.clear()
-                if not interaction.guild:
-                    await interaction.response.send_message(embed=emb("Had l command khdama ghir f server."), ephemeral=True)
-                    return
-                if cd:
-                    key = (interaction.user.id, name)
-                    t = time.time()
-                    if t - cooldowns.get(key, 0) < 3:
-                        await interaction.response.send_message(embed=emb("Hder chwiya! Tsenna 3 tawani w 3awd."), ephemeral=True)
-                        return
-                    cooldowns[key] = t
-                if owner and interaction.user.id != OWNER_ID:
-                    await interaction.response.send_message(embed=emb("Smeh liya, ghir Emrane (mol l bot) li kay9der ydir hadchi."), ephemeral=True)
-                    return
-                if perm:
-                    gp = interaction.user.guild_permissions
-                    if not (gp.administrator or getattr(gp, perm, False)):
-                        await interaction.response.send_message(embed=emb("Ma 3ndekch l sla7iya bach tdir hadchi."), ephemeral=True)
-                        return
-                e = eph or kwargs.get("show") == "private"
-                await interaction.response.defer(ephemeral=e)
-                if not e:
-                    public_def.add(interaction.id)
-                await fn(interaction, *args, **kwargs)
-            except Exception as ex:
-                print(f"[ERROR] /{name}: {ex!r}")
-                try:
-                    if interaction.response.is_done():
-                        if interaction.id not in replied:
-                            await fail(interaction, "Wa7ed l mochkil sra, 3awd jarreb mn ba3d.")
-                    else:
-                        await interaction.response.send_message(embed=emb("Wa7ed l mochkil sra, 3awd jarreb mn ba3d."), ephemeral=True)
-                except Exception:
-                    pass
-            finally:
-                public_def.discard(interaction.id)
-                replied.discard(interaction.id)
-        return wrapper
-    return deco
-
-def get_cfg_channel_id(key, default):
-    v = cfg.get(key)
-    return v if v else default
-
-def chan(guild, key, names=()):
-    cid = cfg.get(key)
-    c = guild.get_channel(cid) if cid else None
-    if c is None:
-        for n in names:
-            c = discord.utils.get(guild.text_channels, name=n)
-            if c:
-                break
-    if c is None and key in ("log", "staff"):
-        c = guild.system_channel
-    return c
-
-async def send_log(guild, action, who, target=None, reason=None):
-    try:
-        ch = chan(guild, "log")
-        if not ch:
-            return
-        fields = [("Action", action), ("Who", getattr(who, "mention", str(who)))]
-        if target is not None:
-            fields.append(("Target", getattr(target, "mention", str(target))))
-        fields.append(("Reason", reason or "Bla sabab", False))
-        fields.append(("Time", discord.utils.format_dt(now(), "F"), False))
-        await ch.send(embed=emb(fields=fields))
-    except Exception as ex:
-        print(f"[LOG ERROR] {ex!r}")
-
-async def dm(user, embed):
-    try:
-        await user.send(embed=embed)
+def owner_only():
+    async def predicate(interaction: discord.Interaction):
+        if interaction.user.id != OWNER_ID:
+            raise app_commands.CheckFailure(
+                "Smeh liya, ghir Emrane (mol l bot) li kay9der ydir hadchi."
+            )
         return True
-    except Exception:
-        return False
+    return app_commands.check(predicate)
 
-async def get_role(guild, name, create=True):
-    r = discord.utils.get(guild.roles, name=name)
-    if r is None and create:
+
+async def reply(interaction, content=None, embed=None, ephemeral=True):
+    if interaction.response.is_done():
+        await interaction.followup.send(content=content, embed=embed, ephemeral=ephemeral)
+    else:
+        await interaction.response.send_message(content=content, embed=embed, ephemeral=ephemeral)
+
+
+def parse_level_roles():
+    result = {}
+    for part in setting("level_roles").split(","):
         try:
-            r = await guild.create_role(name=name, reason="CYBER HEAVEN bot")
-        except Exception:
-            r = None
-    return r
+            level, name = part.split(":", 1)
+            result[int(level.strip())] = name.strip()
+        except ValueError:
+            continue
+    return dict(sorted(result.items()))
 
-def hier_error(i, target):
-    if target.id == i.user.id:
-        return "Ma tqdarch tdir hadchi f rassek."
-    if target.id == i.guild.owner_id:
-        return "Ma tqdarch tdir hadchi m3a mol l server."
-    if i.user.id != i.guild.owner_id and target.top_role >= i.user.top_role:
-        return "Role dyal had l member 3ali 3lik awla b7alk."
-    if target.top_role >= i.guild.me.top_role:
-        return "Role dyali sghir 3la had l member, 3ali l role dyal l bot."
-    return None
 
-async def sync_level_roles(member, level):
-    target = None
-    for lv in sorted(LEVEL_ROLES):
-        if level >= lv:
-            target = LEVEL_ROLES[lv]
-    if not target:
+async def update_level_role(member):
+    roles = parse_level_roles()
+    if not roles:
         return
-    role = await get_role(member.guild, target)
-    if not role:
+    row = get_user(member.guild.id, member.id)
+    earned = [lvl for lvl in roles if row["level"] >= lvl]
+    if not earned:
         return
-    olds = [r for r in member.roles if r.name in LEVEL_ROLES.values() and r.name != target]
-    if olds:
-        await member.remove_roles(*olds, reason="Level up")
-    if role not in member.roles:
-        await member.add_roles(role, reason="Level up")
-
-async def add_xp(member, amount, channel=None):
-    u = U(member.id)
-    if time.time() < u["boost"]:
-        amount *= 2
-    u["xp"] += amount
-    up = False
-    while u["xp"] >= need(u["level"]):
-        u["xp"] -= need(u["level"])
-        u["level"] += 1
-        up = True
-    if up:
-        level_channel = member.guild.get_channel(get_cfg_channel_id("level_channel", LEVEL_UP_CHANNEL_ID)) if member.guild else None
-        target_channel = level_channel if level_channel else channel
-        if target_channel:
-            try:
-                await target_channel.send(embed=emb(f"Mabrouk {member.mention}! Wslti l **level {u['level']}**"))
-            except Exception:
-                pass
-        try:
-            await sync_level_roles(member, u["level"])
-        except Exception:
-            pass
-
-def get_badges(m, u):
-    b = []
-    if m.id == m.guild.owner_id:
-        b.append("Mol l server")
-    if m.premium_since:
-        b.append("Booster")
-    if u["level"] >= 10:
-        b.append("Level 10+")
-    if u["streak"] >= 7:
-        b.append("Streak 7+")
-    if u["money"] + u["bank"] >= 10000:
-        b.append("Ghani")
-    if "VIP" in u["inv"]:
-        b.append("VIP")
-    return b or ["Bla badges"]
-
-def welcome_embed(member=None):
-    who = member.mention if member else "l member jdid"
-    return emb(f"Mar7ba bik {who} f **CYBER HEAVEN**!\nHna kolna 3a2ila wa7da: nl3bo, nhedro, nderro chill w bla drama.\nKhod raha w ntiya f dar dialk.", image=MAIN_IMAGE, color=PINK)
-
-def rules_embed():
-    rc = get_cfg_channel_id("rules_channel", RULES_CHANNEL_ID)
-    return emb("**Qawanin dial CYBER HEAVEN**\n\n" + "\n".join(RULES) + f"\n\nChof dakchi f <#{rc}>")
-
-async def check_warn_thresholds(guild, member):
-    n = len(U(member.id)["warns"])
+    target_name = roles[max(earned)]
+    target = discord.utils.get(member.guild.roles, name=target_name)
+    if target is None:
+        return
+    managed = [discord.utils.get(member.guild.roles, name=name) for name in roles.values()]
+    remove = [r for r in managed if r and r in member.roles and r.id != target.id]
     try:
-        if n >= 5:
-            await guild.ban(member, reason="5 warns")
-            await send_log(guild, "Auto-Ban", bot.user, member, "5 warns")
-            return "Auto-BAN (5 warns)"
-        if n == 3:
-            await member.kick(reason="3 warns")
-            await send_log(guild, "Auto-Kick", bot.user, member, "3 warns")
-            return "Auto-KICK (3 warns)"
-    except Exception:
-        return "Ma9dertch ndir l action automatique"
-    return ""
-
-async def auto_warn(message, reason, do_timeout=False):
-    m = message.author
-    U(m.id)["warns"].append(dict(reason=reason, by="AutoMod", level=1, time=now()))
-    if do_timeout:
-        try:
-            await m.timeout(timedelta(minutes=1), reason=reason)
-        except Exception:
-            pass
-    await send_log(message.guild, "AutoMod warn", bot.user, m, reason)
-    try:
-        await message.channel.send(embed=emb(f"{m.mention} t3ti warn: **{reason}**"), delete_after=8)
-    except Exception:
-        pass
-    await check_warn_thresholds(message.guild, m)
-
-class ConfirmView(discord.ui.View):
-    def __init__(self, user_id, on_confirm):
-        super().__init__(timeout=30)
-        self.user_id = user_id
-        self.on_confirm = on_confirm
-        self.done = False
-        self.message = None
-    async def interaction_check(self, it):
-        if it.user.id != self.user_id:
-            await it.response.send_message(embed=emb("Hadchi machi dialk."), ephemeral=True)
-            return False
-        return True
-    @discord.ui.button(label="Confirmer", style=discord.ButtonStyle.success)
-    async def yes(self, it, button):
-        if self.done:
-            return await it.response.defer()
-        self.done = True
-        for c in self.children:
-            c.disabled = True
-        embed = await self.on_confirm()
-        await it.response.edit_message(embed=embed, view=self)
-        self.stop()
-    @discord.ui.button(label="Annuler", style=discord.ButtonStyle.danger)
-    async def no(self, it, button):
-        if self.done:
-            return await it.response.defer()
-        self.done = True
-        for c in self.children:
-            c.disabled = True
-        await it.response.edit_message(embed=emb("Tkanselat l 3amaliya."), view=self)
-        self.stop()
-    async def on_timeout(self):
-        if self.done or not self.message:
-            return
-        for c in self.children:
-            c.disabled = True
-        try:
-            await self.message.edit(embed=emb("Wa9t salla, tkanselat l 3amaliya."), view=self)
-        except Exception:
-            pass
+        if remove:
+            await member.remove_roles(*remove, reason="CYBER HEAVEN level role update")
+        if target not in member.roles:
+            await member.add_roles(target, reason="CYBER HEAVEN level reward")
+    except discord.Forbidden:
+        log.warning("Cannot update level roles for %s: check bot role hierarchy.", member.id)
 
 
-async def join_voice_247(guild):
-    try:
-        vc_id = cfg.get("voice_channel")
-        if not vc_id or not cfg.get("voice_247"):
-            return
-        ch = guild.get_channel(vc_id)
-        if not ch:
-            return
-        if guild.voice_client and guild.voice_client.is_connected():
-            if guild.voice_client.channel.id == vc_id:
-                return
-            await guild.voice_client.move_to(ch)
-            return
-        await ch.connect(self_deaf=True, self_mute=False)
-        print(f"Joined voice 24/7: {ch.name} in {guild.name}")
-    except Exception as ex:
-        print(f"[VOICE 24/7] {ex!r}")
+async def add_xp(member, amount):
+    if member.bot:
+        return
+    row = get_user(member.guild.id, member.id)
+    new_xp = row["xp"] + amount
+    new_level = row["level"]
+    levelled = False
+    while new_xp >= need_xp(new_level):
+        new_xp -= need_xp(new_level)
+        new_level += 1
+        levelled = True
+    with db() as con:
+        con.execute(
+            "UPDATE users SET xp=?,level=?,messages=messages+1 WHERE guild_id=? AND user_id=?",
+            (new_xp, new_level, member.guild.id, member.id)
+        )
+    if levelled:
+        await update_level_role(member)
+        channel_id = int(setting("level_channel"))
+        channel = member.guild.get_channel(channel_id) if channel_id else None
+        if channel:
+            await channel.send(embed=make_embed(
+                "Level Up!",
+                f"Mabrouk {member.mention}, wslti l level **{new_level}**!"
+            ))
 
 
-async def voice_xp_loop():
-    await bot.wait_until_ready()
-    while not bot.is_closed():
-        try:
-            for guild in bot.guilds:
-                for vc in guild.voice_channels:
-                    for member in vc.members:
-                        if member.bot:
-                            continue
-                        # Kol dqiqa f sot = 50 XP
-                        await add_xp(member, 50, None)
-            await asyncio.sleep(60)
-        except Exception as ex:
-            print(f"[VOICE XP] {ex!r}")
-            await asyncio.sleep(60)
+class CyberBot(commands.Bot):
+    async def setup_hook(self):
+        init_db()
+        if not GUILD_ID:
+            raise RuntimeError("Set GUILD_ID in Railway Variables to lock the bot to its official server.")
+        guild = discord.Object(id=GUILD_ID)
+        self.tree.copy_global_to(guild=guild)
+        synced = await self.tree.sync(guild=guild)
+        log.info("Synced %s slash commands to guild %s", len(synced), GUILD_ID)
+        voice_xp_loop.start()
+
+
+intents = discord.Intents.default()
+intents.guilds = True
+intents.members = True
+intents.messages = True
+intents.message_content = True
+intents.voice_states = True
+
+bot = CyberBot(command_prefix=commands.when_mentioned, intents=intents)
+
 
 @bot.event
 async def on_ready():
-    global synced
-    print(f"Logged in as {bot.user} | servers: {len(bot.guilds)}")
-    if not synced:
-        synced = True
-        try:
-            cmds = await bot.tree.sync()
-            print(f"Synced {len(cmds)} slash commands")
-        except Exception as ex:
-            print(f"[SYNC ERROR] {ex!r}")
-    await bot.change_presence(activity=discord.Game("CYBER HEAVEN | /help"))
-    if not getattr(bot, "voice_xp_started", False):
-        bot.voice_xp_started = True
-        bot.loop.create_task(voice_xp_loop())
-    for g in bot.guilds:
-        await join_voice_247(g)
+    log.info("Logged in as %s", bot.user)
+    if setting("voice_24_7") == "1":
+        await reconnect_saved_voice()
 
-@bot.tree.error
-async def on_tree_error(interaction, error):
-    print(f"[TREE ERROR] {error!r}")
-    try:
-        e = emb("Wa7ed l mochkil sra, 3awd jarreb mn ba3d.")
-        if interaction.response.is_done():
-            await interaction.followup.send(embed=e, ephemeral=True)
-        else:
-            await interaction.response.send_message(embed=e, ephemeral=True)
-    except Exception:
-        pass
 
-@bot.event
-async def on_member_join(member):
+async def reconnect_saved_voice():
+    if not GUILD_ID or setting("voice_24_7") != "1":
+        return
+    guild = bot.get_guild(GUILD_ID)
+    channel_id = int(setting("voice_channel"))
+    channel = guild.get_channel(channel_id) if guild and channel_id else None
+    if not isinstance(channel, discord.VoiceChannel) or guild.voice_client:
+        return
     try:
-        role = await get_role(member.guild, "Member", create=False)
-        if role:
-            await member.add_roles(role, reason="Auto role")
-    except Exception as ex:
-        print(f"[AUTOROLE] {ex!r}")
-    await dm(member, welcome_embed(member))
-    await dm(member, rules_embed())
-    await send_log(member.guild, "Member joined", member, None, "Join")
+        await channel.connect(self_deaf=True)
+        log.info("Reconnected to saved voice channel %s", channel.id)
+    except (discord.Forbidden, discord.ClientException) as exc:
+        log.warning("Voice reconnect failed: %s", exc)
 
 
 @bot.event
 async def on_voice_state_update(member, before, after):
-    # If bot was disconnected, rejoin if 24/7 is on
-    if member.id == bot.user.id and after.channel is None:
-        if cfg.get("voice_247") and member.guild:
-            await asyncio.sleep(3)
-            await join_voice_247(member.guild)
+    if not member.bot or bot.user is None or member.id != bot.user.id:
+        return
+    if setting("voice_24_7") != "1" or after.channel is not None:
+        return
+    await discord.utils.sleep_until(discord.utils.utcnow() + timedelta(seconds=3))
+    await reconnect_saved_voice()
 
-@bot.event
-async def on_member_remove(member):
-    await send_log(member.guild, "Member left", member, None, "Leave")
 
 @bot.event
 async def on_message(message):
-    if message.author.bot or not message.guild:
+    if message.author.bot or not message.guild or message.guild.id != GUILD_ID:
         return
-    try:
-        m = message.author
-        admin = m.guild_permissions.administrator
-        if not admin:
-            if INVITE_RE.search(message.content):
-                try:
-                    await message.delete()
-                except Exception:
-                    pass
-                await auto_warn(message, "Invite link ma m3roufch")
-                return
-            dq = spam[m.id]
-            t = time.time()
-            dq.append(t)
-            if len([x for x in dq if t - x <= 5]) >= 5:
-                dq.clear()
-                try:
-                    await message.channel.purge(limit=10, check=lambda x: x.author.id == m.id)
-                except Exception:
-                    pass
-                await auto_warn(message, "Spam", do_timeout=True)
-                return
-        if counting["channel"] == message.channel.id:
-            txt = message.content.strip()
-            if txt.isdigit() and int(txt) == counting["current"] + 1:
-                counting["current"] += 1
-                try:
-                    await message.add_reaction("✅")
-                except Exception:
-                    pass
-            else:
-                try:
-                    await message.delete()
-                except Exception:
-                    pass
-                counting["current"] = 0
-                await message.channel.send(embed=emb(f"{m.mention} ghalat! L3d tbda mn **1**"), delete_after=6)
-            return
-        if m.id in afk:
-            del afk[m.id]
-            await message.channel.send(embed=emb(f"Mar7ba bik raja3ti {m.mention}, tm7a l AFK dialk."), delete_after=8)
-        for mem in message.mentions:
-            a = afk.get(mem.id)
-            if a:
-                if a["until"] and now() > a["until"]:
-                    del afk[mem.id]
+    low = message.content.lower()
+    if "discord.gg/" in low or "discord.com/invite/" in low:
+        try:
+            await message.delete()
+            await message.channel.send(
+                f"{message.author.mention} bla links dyal invites bla idn staff.",
+                delete_after=8
+            )
+            with db() as con:
+                con.execute(
+                    "UPDATE users SET warnings=warnings+1 WHERE guild_id=? AND user_id=?",
+                    (message.guild.id, message.author.id)
+                )
+        except discord.Forbidden:
+            log.warning("Missing Manage Messages permission.")
+        return
+    await add_xp(message.author, random.randint(int(setting("xp_min")), int(setting("xp_max"))))
+
+
+@bot.event
+async def on_member_join(member):
+    if member.guild.id != GUILD_ID:
+        return
+    role_id = int(setting("auto_role"))
+    role = member.guild.get_role(role_id) if role_id else None
+    if role:
+        try:
+            await member.add_roles(role, reason="Automatic newcomer role")
+        except discord.Forbidden:
+            pass
+    channel_id = int(setting("welcome_channel"))
+    channel = member.guild.get_channel(channel_id) if channel_id else None
+    if channel:
+        text = setting("welcome_text").replace("{server}", member.guild.name).replace("{user}", member.mention)
+        await channel.send(embed=make_embed("Welcome", text))
+    log_id = int(setting("log_channel"))
+    log_channel = member.guild.get_channel(log_id) if log_id else None
+    if log_channel:
+        await log_channel.send(embed=make_embed("Member joined", f"{member.mention} dkhlo l server."))
+
+
+@bot.event
+async def on_member_remove(member):
+    if member.guild.id != GUILD_ID:
+        return
+    log_id = int(setting("log_channel"))
+    channel = member.guild.get_channel(log_id) if log_id else None
+    if channel:
+        await channel.send(embed=make_embed("Member left", f"**{member}** khrej mn server."))
+
+
+@tasks.loop(seconds=60)
+async def voice_xp_loop():
+    for guild in bot.guilds:
+        if guild.id != GUILD_ID:
+            continue
+        for voice in guild.voice_channels:
+            for member in voice.members:
+                if member.bot or member.voice is None:
                     continue
-                await message.channel.send(embed=emb(f"{mem.display_name} AFK daba: **{a['reason']}**"), delete_after=10)
-        # No cooldown - kol message kayt7seb
-        await add_xp(m, random.randint(5, 15), message.channel)
-    except Exception as ex:
-        print(f"[ON_MESSAGE] {ex!r}")
+                if member.voice.self_deaf or member.voice.deaf:
+                    continue
+                row = get_user(guild.id, member.id)
+                new_xp = row["xp"] + int(setting("voice_xp"))
+                level = row["level"]
+                did_level = False
+                while new_xp >= need_xp(level):
+                    new_xp -= need_xp(level)
+                    level += 1
+                    did_level = True
+                with db() as con:
+                    con.execute(
+                        "UPDATE users SET xp=?,level=? WHERE guild_id=? AND user_id=?",
+                        (new_xp, level, guild.id, member.id)
+                    )
+                if did_level:
+                    await update_level_role(member)
+                    channel_id = int(setting("level_channel"))
+                    channel = guild.get_channel(channel_id) if channel_id else None
+                    if channel:
+                        await channel.send(embed=make_embed(
+                            "Level Up!", f"Mabrouk {member.mention}, wslti l level **{level}**!"
+                        ))
 
-HELP = {
-    "3ama": ["`/help`", "`/ping`", "`/profile`", "`/avatar` `/banner`", "`/userinfo` `/serverinfo`", "`/top` `/rank`", "`/afk`", "`/ticket` `/suggest` `/report` `/remind` `/ask`"],
-    "flous": ["`/daily` `/balance` `/deposit` `/withdraw` `/transfer`", "`/gamble` `/work` `/rob`", "`/shop` `/buy` `/inventory` `/use`"],
-    "al3ab": ["`/8ball` `/rps` `/coinflip` `/dice` `/slot`", "`/truth` `/dare` `/joke` `/meme` `/ship` `/hug`", "`/quiz` `/giveaway` `/poll` `/counting_setup`"],
-    "idara": ["`/kick` `/ban` `/unban` `/timeout` `/untimeout`", "`/warn` `/warnings` `/clearwarns`", "`/clear` `/lock` `/unlock` `/slowmode`", "`/send` `/send_rules` `/send_welcome` `/announce` `/setup`", "`/close_ticket` `/add_user`"],
-}
 
-@bot.tree.command(name="help", description="Chof ga3 l commands dial l bot")
-@app_commands.describe(category="Khtar l9ism li bghiti")
-@safe()
-async def help_cmd(i: discord.Interaction, category: Literal['3ama', 'flous', 'al3ab', 'idara', 'kolchi'] = 'kolchi'):
-    cats = list(HELP) if category == 'kolchi' else [category]
-    fields = [(c.upper(), "\n".join(HELP[c]), False) for c in cats]
-    await rep(i, embed=emb("Hado homa l commands dial **CYBER HEAVEN**", fields=fields, thumb=MAIN_IMAGE))
+@voice_xp_loop.before_loop
+async def before_voice_loop():
+    await bot.wait_until_ready()
 
-@bot.tree.command(name="ping", description="Chof sor3a dial l bot")
-@safe()
-async def ping_cmd(i: discord.Interaction):
-    up = int((now() - START).total_seconds())
-    d, rem = divmod(up, 86400)
-    h, rem = divmod(rem, 3600)
-    mi, s = divmod(rem, 60)
-    await rep(i, embed=emb(fields=[("Latency", f"{round(bot.latency * 1000)} ms"), ("Uptime", f"{d}d {h}h {mi}m {s}s"), ("Status", "Online"), ("Servers", str(len(bot.guilds)))]))
 
-@bot.tree.command(name="profile", description="Chof profile dialek")
-@safe()
-async def profile_cmd(i: discord.Interaction, member: discord.Member = None):
-    m = member or i.user
-    u = U(m.id)
-    nxt = need(u["level"])
-    roles = [r.mention for r in reversed(m.roles) if r != i.guild.default_role][:10]
-    await rep(i, embed=emb(f"Profile dial {m.mention}", thumb=m.display_avatar.url, fields=[("Flous", f"Wallet: **{fmt(u['money'])}**\nBank: **{fmt(u['bank'])}**"), ("Level", f"**{u['level']}**"), ("XP", f"{bar(u['xp'], nxt)} {u['xp']}/{nxt}", False), ("Warnings", str(len(u["warns"]))), ("Roles", " ".join(roles) or "Walo", False), ("Badges", " | ".join(get_badges(m, u)), False)]))
+@bot.tree.command(name="ping", description="Check bot response time")
+async def ping(interaction: discord.Interaction):
+    await reply(interaction, f"Pong! `{round(bot.latency * 1000)}ms`")
 
-@bot.tree.command(name="avatar", description="Chof avatar dial chi wa7ed")
-@safe()
-async def avatar_cmd(i: discord.Interaction, member: discord.Member = None, size: Literal[128, 256, 512, 1024] = 512):
-    m = member or i.user
-    url = m.display_avatar.with_size(size).url
-    view = discord.ui.View()
-    view.add_item(discord.ui.Button(label="Download", url=url))
-    await rep(i, embed=emb(f"Avatar dial {m.mention} ({size}px)", image=url), view=view)
 
-@bot.tree.command(name="userinfo", description="Kol ma3lomat 3la chi member")
-@safe()
-async def userinfo_cmd(i: discord.Interaction, member: discord.Member = None):
-    m = member or i.user
-    await rep(i, embed=emb(f"Info dial {m.mention}", thumb=m.display_avatar.url, fields=[("ID", str(m.id)), ("Created", discord.utils.format_dt(m.created_at, "D")), ("Joined", discord.utils.format_dt(m.joined_at, "D") if m.joined_at else "?"), ("Highest role", m.top_role.mention), ("Status", str(m.status))]))
+@bot.tree.command(name="help", description="Show bot command categories")
+async def help_command(interaction: discord.Interaction):
+    embed = make_embed("CYBER HEAVEN | Help")
+    embed.add_field(name="General", value="/ping /help /profile /rank /top /serverinfo", inline=False)
+    embed.add_field(name="Economy", value="/daily /balance /work /deposit /withdraw /transfer /shop /buy /inventory", inline=False)
+    embed.add_field(name="Moderation", value="/warn /warnings /clearwarns /timeout /untimeout /kick /ban /clear", inline=False)
+    embed.add_field(name="Owner", value="/setup /config /send /announce /addxp /setlevel /voice_setup /set_embed_color", inline=False)
+    await reply(interaction, embed=embed)
 
-@bot.tree.command(name="serverinfo", description="Chof ma3lomat dial server")
-@safe()
-async def serverinfo_cmd(i: discord.Interaction):
-    g = i.guild
-    online = len([x for x in g.members if x.status != discord.Status.offline])
-    bots = len([x for x in g.members if x.bot])
-    await rep(i, embed=emb(f"**{g.name}**", thumb=g.icon.url if g.icon else None, fields=[("ID", str(g.id)), ("Owner", f"<@{g.owner_id}>"), ("Members", str(g.member_count)), ("Online", str(online)), ("Bots", str(bots)), ("Channels", str(len(g.channels))), ("Roles", str(len(g.roles)))]))
 
-@bot.tree.command(name="top", description="Classement dial l members")
-@safe()
-async def top_cmd(i: discord.Interaction, type: Literal['level', 'flous', 'xp', 'warnings'] = 'level', limit: Literal[5, 10, 20] = 10):
-    keyf = {"level": lambda u: (u["level"], u["xp"]), "flous": lambda u: u["money"] + u["bank"], "xp": total_xp, "warnings": lambda u: len(u["warns"])}[type]
-    shown = {"level": lambda u: f"Level {u['level']}", "flous": lambda u: f"{fmt(u['money'] + u['bank'])} flous", "xp": lambda u: f"{fmt(total_xp(u))} XP", "warnings": lambda u: f"{len(u['warns'])} warns"}[type]
-    ordered = sorted(users.items(), key=lambda kv: keyf(kv[1]), reverse=True)[:limit]
-    if not ordered:
-        return await rep(i, embed=emb("Ba9i walo f classement!"))
-    lines = [f"**{n}.** <@{uid}> - {shown(u)}" for n, (uid, u) in enumerate(ordered, 1)]
-    await rep(i, embed=emb(f"**Top {limit} - {type}**\n\n" + "\n".join(lines)))
+@bot.tree.command(name="profile", description="Show your community profile")
+async def profile(interaction: discord.Interaction, member: discord.Member = None):
+    member = member or interaction.user
+    row = get_user(interaction.guild_id, member.id)
+    embed = make_embed(f"Profile | {member.display_name}")
+    embed.set_thumbnail(url=member.display_avatar.url)
+    embed.add_field(name="Level", value=str(row["level"]))
+    embed.add_field(name="XP", value=f"{row['xp']} / {need_xp(row['level'])}")
+    embed.add_field(name="Wallet", value=f"{row['wallet']:,}")
+    embed.add_field(name="Bank", value=f"{row['bank']:,}")
+    embed.add_field(name="Messages", value=str(row["messages"]))
+    await reply(interaction, embed=embed, ephemeral=False)
 
-@bot.tree.command(name="rank", description="Chof rank card dialek")
-@safe()
-async def rank_cmd(i: discord.Interaction):
-    u = U(i.user.id)
-    nxt = need(u["level"])
-    pos, tot = rank_of(i.user.id)
-    await rep(i, embed=emb(f"Rank dial {i.user.mention}", thumb=i.user.display_avatar.url, fields=[("Level", str(u["level"])), ("Rank", f"#{pos} / {tot}"), ("XP", f"{bar(u['xp'], nxt, 15)}\n{u['xp']}/{nxt}", False)]))
 
-@bot.tree.command(name="afk", description="Dir rassek AFK")
-@safe()
-async def afk_cmd(i: discord.Interaction, reason: str = "Ma 3ndi sabab", duration: Literal['10min', '1h', '1day', 'custom'] = '1h', custom_minutes: app_commands.Range[int, 1, 10080] = 30):
-    mins = {'10min': 10, '1h': 60, '1day': 1440, 'custom': custom_minutes}[duration]
-    afk[i.user.id] = {"reason": reason, "until": now() + timedelta(minutes=mins)}
-    await rep(i, embed=emb(f"{i.user.mention} daba AFK: **{reason}** ({mins} dqiqa)"))
+@bot.tree.command(name="rank", description="Show your current rank")
+async def rank(interaction: discord.Interaction, member: discord.Member = None):
+    member = member or interaction.user
+    row = get_user(interaction.guild_id, member.id)
+    progress = min(100, int(row["xp"] / need_xp(row["level"]) * 100))
+    await reply(interaction, f"{member.mention} | Level **{row['level']}** | XP **{row['xp']}/{need_xp(row['level'])}** | Progress **{progress}%**", ephemeral=False)
 
-JOBS = {"police": ["Mseki lik wa7ed hrami."], "doctor": ["3alajti 3 marda."], "teacher": ["Chr7ti dars."], "gamer": ["Rbe7ti tournoi."], "hacker": ["L9iti bug."], "streamer": ["Dert live."]}
-SHOP = {"VIP": ("Role VIP", 5000, "Role VIP"), "Legend": ("Role Legend", 10000, "Role Legend"), "Color": ("Custom Color", 2000, "Color"), "XPBoost": ("XP Boost", 3000, "x2 XP 1h"), "Shield": ("Shield", 1500, "Anti-rob")}
-ItemChoice = Literal['VIP', 'Legend', 'Color', 'XPBoost', 'Shield']
 
-@bot.tree.command(name="daily", description="Khod flous dial lyoum")
-@safe()
-async def daily_cmd(i: discord.Interaction):
-    u = U(i.user.id)
-    today = now().date()
-    if u["daily"] == today:
-        return await fail(i, "Derti daily lyoum deja!")
-    u["streak"] = u["streak"] + 1 if u["daily"] == today - timedelta(days=1) else 1
-    total = random.randint(100, 300) + u["streak"] * 20
-    u["money"] += total
-    u["daily"] = today
-    await rep(i, embed=emb(f"Khditi **{total}** flous! Streak: {u['streak']} yawm"))
+@bot.tree.command(name="top", description="Show server leaderboard")
+@app_commands.choices(kind=[
+    app_commands.Choice(name="Level", value="level"),
+    app_commands.Choice(name="Wallet", value="wallet"),
+    app_commands.Choice(name="XP", value="xp"),
+    app_commands.Choice(name="Warnings", value="warnings"),
+])
+async def top(interaction: discord.Interaction, kind: app_commands.Choice[str], limit: app_commands.Range[int, 5, 20] = 10):
+    column = kind.value
+    with db() as con:
+        rows = con.execute(
+            f"SELECT user_id,{column} AS score FROM users WHERE guild_id=? ORDER BY {column} DESC LIMIT ?",
+            (interaction.guild_id, limit)
+        ).fetchall()
+    lines = []
+    for index, row in enumerate(rows, 1):
+        lines.append(f"**{index}.** <@{row['user_id']}> — `{row['score']}`")
+    await reply(interaction, embed=make_embed(f"Leaderboard | {kind.name}", "\n".join(lines) or "Mazal ma kayn ta data."), ephemeral=False)
 
-@bot.tree.command(name="balance", description="Chof flous dialek")
-@safe()
-async def balance_cmd(i: discord.Interaction, member: discord.Member = None):
-    m = member or i.user
-    u = U(m.id)
-    await rep(i, embed=emb(f"Flous dial {m.mention}", fields=[("Wallet", fmt(u["money"])), ("Bank", fmt(u["bank"]))]))
 
-@bot.tree.command(name="deposit", description="Dkhel flous l bank")
-@safe()
-async def deposit_cmd(i: discord.Interaction, amount: Literal['100', '500', '1000', 'all']):
-    u = U(i.user.id)
-    amt = u["money"] if amount == "all" else int(amount)
-    if amt <= 0 or amt > u["money"]:
-        return await fail(i, "Ma 3ndekch had l mablagh.")
-    u["money"] -= amt
-    u["bank"] += amt
-    await rep(i, embed=emb(f"Dkhlti **{fmt(amt)}** l bank."))
+@bot.tree.command(name="daily", description="Collect your daily community reward")
+async def daily(interaction: discord.Interaction):
+    row = get_user(interaction.guild_id, interaction.user.id)
+    today = date.today().isoformat()
+    if row["last_daily"] == today:
+        return await reply(interaction, "Rje3 ghdda bach takhod daily reward.")
+    yesterday = (date.today()).fromordinal(date.today().toordinal() - 1).isoformat()
+    streak = row["daily_streak"] + 1 if row["last_daily"] == yesterday else 1
+    amount = random.randint(int(setting("daily_min")), int(setting("daily_max"))) + streak * 20
+    with db() as con:
+        con.execute(
+            "UPDATE users SET wallet=wallet+?,last_daily=?,daily_streak=? WHERE guild_id=? AND user_id=?",
+            (amount, today, streak, interaction.guild_id, interaction.user.id)
+        )
+    await reply(interaction, f"Daily reward: **{amount:,} coins**. Streak: **{streak}**!")
 
-@bot.tree.command(name="withdraw", description="Khrej flous mn bank")
-@safe()
-async def withdraw_cmd(i: discord.Interaction, amount: app_commands.Range[int, 1, 100000000]):
-    u = U(i.user.id)
-    if amount > u["bank"]:
-        return await fail(i, "Ma 3ndekch had l mablagh f bank.")
-    u["bank"] -= amount
-    u["money"] += amount
-    await rep(i, embed=emb(f"Khrjti **{fmt(amount)}** mn bank."))
 
-@bot.tree.command(name="transfer", description="Sift flous l chi wa7ed")
-@safe()
-async def transfer_cmd(i: discord.Interaction, member: discord.Member, amount: app_commands.Range[int, 1, 100000000]):
-    if member.bot or member.id == i.user.id:
-        return await fail(i, "Ma tqdarch tsift l rassek.")
-    u = U(i.user.id)
-    if amount > u["money"]:
-        return await fail(i, "Ma 3ndekch flous kafyin.")
-    u["money"] -= amount
-    U(member.id)["money"] += amount
-    await rep(i, embed=emb(f"{i.user.mention} sift **{fmt(amount)}** l {member.mention}"))
+@bot.tree.command(name="balance", description="Check your wallet and bank")
+async def balance(interaction: discord.Interaction, member: discord.Member = None):
+    member = member or interaction.user
+    row = get_user(interaction.guild_id, member.id)
+    await reply(interaction, f"{member.mention}\nWallet: **{row['wallet']:,}**\nBank: **{row['bank']:,}**", ephemeral=False)
 
-@bot.tree.command(name="gamble", description="Lo3b b flous dialek")
-@safe()
-async def gamble_cmd(i: discord.Interaction, amount: app_commands.Range[int, 1, 1000000], game: Literal['coinflip', 'dice', 'slot', 'roulette'], pick: str = None):
-    u = U(i.user.id)
-    if amount > u["money"]:
-        return await fail(i, "Ma 3ndekch flous kafyin.")
-    pick = (pick or "").strip().lower()
-    mult, detail = 0, ""
-    if game == "coinflip":
-        pick = pick if pick in ("ras", "ktaba") else random.choice(["ras", "ktaba"])
-        res = random.choice(["ras", "ktaba"])
-        mult = 2 if res == pick else 0
-        detail = f"Khtarti **{pick}** w tla3 **{res}**"
-    elif game == "dice":
-        if not pick.isdigit() or not 1 <= int(pick) <= 6:
-            return await fail(i, "F dice khtar raqm 1-6.")
-        res = random.randint(1, 6)
-        mult = 5 if res == int(pick) else 0
-        detail = f"Khtarti **{pick}** w tla3 **{res}**"
-    elif game == "slot":
-        res = [random.choice(["🍒", "🍋", "🍇", "💎"]) for _ in range(3)]
-        mult = 10 if len(set(res)) == 1 else 0
-        detail = " | ".join(res)
-    else:
-        if pick not in ("red", "black"):
-            return await fail(i, "F roulette khtar red awla black.")
-        n = random.randint(0, 36)
-        reds = {1, 3, 5, 7, 9, 12, 14, 16, 18, 19, 21, 23, 25, 27, 30, 32, 34, 36}
-        col = "green" if n == 0 else ("red" if n in reds else "black")
-        mult = 2 if col == pick else 0
-        detail = f"Khtarti **{pick}** w tla3 **{n} ({col})**"
-    net = amount * (mult - 1)
-    u["money"] += net
-    await rep(i, embed=emb(f"**{game}**\n{detail}\n\n" + (f"Rbe7ti **{fmt(amount*mult)}**" if mult else f"Khsarti **{fmt(amount)}**")))
 
-@bot.tree.command(name="work", description="Khdem w rbe7 flous")
-@safe()
-async def work_cmd(i: discord.Interaction, job: Literal['police', 'doctor', 'teacher', 'gamer', 'hacker', 'streamer']):
-    u = U(i.user.id)
-    left = 3600 - (time.time() - u["work_last"])
-    if left > 0:
-        return await fail(i, f"Rje3 mn b3d **{int(left//60)} dqiqa**.")
-    earn = random.randint(50, 200)
-    u["money"] += earn
-    u["job"] = job
-    u["work_last"] = time.time()
-    await rep(i, embed=emb(f"{random.choice(JOBS[job])}\nKhditi **{earn}** flous."))
-    await add_xp(i.user, 15)
+@bot.tree.command(name="work", description="Complete a community job for coins")
+async def work(interaction: discord.Interaction):
+    jobs = ["teacher", "designer", "builder", "moderator assistant", "event helper"]
+    amount = random.randint(40, 120)
+    job = random.choice(jobs)
+    with db() as con:
+        con.execute(
+            "UPDATE users SET wallet=wallet+? WHERE guild_id=? AND user_id=?",
+            (amount, interaction.guild_id, interaction.user.id)
+        )
+    await reply(interaction, f"Khdemti mzyan kـ **{job}** w rb7ti **{amount} coins**!")
 
-@bot.tree.command(name="rob", description="7awel tsre9 chi wa7ed")
-@safe()
-async def rob_cmd(i: discord.Interaction, member: discord.Member):
-    if member.bot or member.id == i.user.id:
-        return await fail(i, "Ma tqdarch tsre9 l rassek.")
-    u, v = U(i.user.id), U(member.id)
-    if v["money"] < 100:
-        return await fail(i, "Had l member ma 3ndoch flous.")
-    if random.random() < 0.4:
-        stolen = max(1, int(v["money"] * 0.2))
-        v["money"] -= stolen
-        u["money"] += stolen
-        await rep(i, embed=emb(f"Najaht! Srti **{fmt(stolen)}** mn {member.mention}"))
-    else:
-        fine = 50
-        u["money"] -= fine
-        v["money"] += fine
-        await rep(i, embed=emb(f"T7bst! Khlst ghrama **{fine}** l {member.mention}"))
 
-@bot.tree.command(name="shop", description="Chof l7anout")
-@safe()
-async def shop_cmd(i: discord.Interaction):
-    fields = [(f"{v[0]} - {fmt(v[1])}", v[2], False) for v in SHOP.values()]
-    await rep(i, embed=emb("**L7anout dial CYBER HEAVEN**", fields=fields))
+@bot.tree.command(name="deposit", description="Move coins from wallet to bank")
+async def deposit(interaction: discord.Interaction, amount: app_commands.Range[int, 1, 100000000]):
+    row = get_user(interaction.guild_id, interaction.user.id)
+    if row["wallet"] < amount:
+        return await reply(interaction, "Ma 3ndkch had l montant f wallet.")
+    with db() as con:
+        con.execute("UPDATE users SET wallet=wallet-?,bank=bank+? WHERE guild_id=? AND user_id=?",
+                    (amount, amount, interaction.guild_id, interaction.user.id))
+    await reply(interaction, f"Deposited **{amount:,} coins**.")
 
-@bot.tree.command(name="buy", description="Chri chi 7aja")
-@safe()
-async def buy_cmd(i: discord.Interaction, item: ItemChoice):
-    u = U(i.user.id)
-    label, price, _ = SHOP[item]
-    if u["money"] < price:
-        return await fail(i, "Ma 3ndekch flous kafyin.")
-    u["money"] -= price
-    u["inv"].append(item)
-    await rep(i, embed=emb(f"Chriti **{label}** b {fmt(price)} flous."))
 
-@bot.tree.command(name="inventory", description="Chof l7wayj dialek")
-@safe()
-async def inventory_cmd(i: discord.Interaction, member: discord.Member = None):
-    m = member or i.user
-    c = Counter(U(m.id)["inv"])
-    desc = "\n".join(f"{SHOP[k][0]} x{n}" for k, n in c.items()) or "Inventory khawi."
-    await rep(i, embed=emb(f"Inventory dial {m.mention}\n\n{desc}"))
+@bot.tree.command(name="withdraw", description="Move coins from bank to wallet")
+async def withdraw(interaction: discord.Interaction, amount: app_commands.Range[int, 1, 100000000]):
+    row = get_user(interaction.guild_id, interaction.user.id)
+    if row["bank"] < amount:
+        return await reply(interaction, "Ma 3ndkch had l montant f bank.")
+    with db() as con:
+        con.execute("UPDATE users SET wallet=wallet+?,bank=bank-? WHERE guild_id=? AND user_id=?",
+                    (amount, amount, interaction.guild_id, interaction.user.id))
+    await reply(interaction, f"Withdrawn **{amount:,} coins**.")
 
-@bot.tree.command(name="use", description="St3mel chi 7aja")
-@safe()
-async def use_cmd(i: discord.Interaction, item: ItemChoice):
-    u = U(i.user.id)
-    if item not in u["inv"]:
-        return await fail(i, "Ma 3ndekch had l 7aja.")
-    if item == "XPBoost":
-        u["inv"].remove("XPBoost")
-        u["boost"] = time.time() + 3600
-        return await rep(i, embed=emb("XP Boost tfa3l: x2 XP l 1 sa3a!"))
-    await rep(i, embed=emb(f"St3melti **{item}**."))
 
-BALL = ["Iyeh, 100%", "Bla chak", "Akid", "Ymkn", "Ma3raftch", "La, ma tdirhch", "Kolchi ghadi ymchi l khir", "Sbr w ghadi tchof"]
-TRUTHS = ["Achno akbar khta3 dertiha?", "Chkoun akhir wa7ed kteb lik?", "Achno akthar 7aja kat5afha?"]
-DARES = ["Sift voice message b sout robot.", "Beddel smiyt dialk l 10 dqayq.", "Kteb poeme 3la CYBER HEAVEN."]
+@bot.tree.command(name="transfer", description="Transfer coins to another member")
+async def transfer(interaction: discord.Interaction, member: discord.Member, amount: app_commands.Range[int, 1, 100000000]):
+    if member.bot or member.id == interaction.user.id:
+        return await reply(interaction, "Khtar member akhor.")
+    row = get_user(interaction.guild_id, interaction.user.id)
+    if row["wallet"] < amount:
+        return await reply(interaction, "Ma 3ndkch had l montant.")
+    with db() as con:
+        con.execute("UPDATE users SET wallet=wallet-? WHERE guild_id=? AND user_id=?",
+                    (amount, interaction.guild_id, interaction.user.id))
+        con.execute("UPDATE users SET wallet=wallet+? WHERE guild_id=? AND user_id=?",
+                    (amount, interaction.guild_id, member.id))
+    await reply(interaction, f"3titi **{amount:,} coins** lـ {member.mention}.")
 
-@bot.tree.command(name="kick", description="Tred chi member")
-@app_commands.default_permissions(kick_members=True)
-@safe(eph=True, perm="kick_members")
-async def kick_cmd(i: discord.Interaction, member: discord.Member, reason: str = "Bla sabab"):
-    err = hier_error(i, member)
-    if err:
-        return await fail(i, err)
-    await member.kick(reason=reason)
-    await send_log(i.guild, "Kick", i.user, member, reason)
-    await rep(i, embed=emb(f"T kicka **{member}**"), ephemeral=True)
 
-@bot.tree.command(name="ban", description="Bani chi member")
-@app_commands.default_permissions(ban_members=True)
-@safe(eph=True, perm="ban_members")
-async def ban_cmd(i: discord.Interaction, member: discord.Member, reason: str = "Bla sabab"):
-    err = hier_error(i, member)
-    if err:
-        return await fail(i, err)
-    await i.guild.ban(member, reason=reason)
-    await send_log(i.guild, "Ban", i.user, member, reason)
-    await rep(i, embed=emb(f"T banna **{member}**"), ephemeral=True)
+@bot.tree.command(name="shop", description="View the community shop")
+async def shop(interaction: discord.Interaction):
+    with db() as con:
+        rows = con.execute("SELECT item,price,description FROM shop ORDER BY price").fetchall()
+    desc = "\n".join(f"**{r['item']}** — {r['price']:,} coins\n{r['description']}" for r in rows)
+    await reply(interaction, embed=make_embed("Community Shop", desc or "Shop khawi."))
 
-@bot.tree.command(name="unban", description="Fek l ban b ID")
-@app_commands.default_permissions(ban_members=True)
-@safe(eph=True, perm="ban_members")
-async def unban_cmd(i: discord.Interaction, user_id: str):
-    await i.guild.unban(discord.Object(id=int(user_id)))
-    await rep(i, embed=emb(f"T fek l ban 3la <@{user_id}>"), ephemeral=True)
 
-@bot.tree.command(name="timeout", description="Timeout")
-@app_commands.default_permissions(moderate_members=True)
-@safe(eph=True, perm="moderate_members")
-async def timeout_cmd(i: discord.Interaction, member: discord.Member, duration: Literal['1min', '10min', '1h', '1day'], reason: str = "Bla sabab"):
-    await member.timeout(timedelta(minutes=TO_MINS[duration]), reason=reason)
-    await rep(i, embed=emb(f"{member.mention} f timeout l **{duration}**"), ephemeral=True)
+@bot.tree.command(name="buy", description="Buy an item from the community shop")
+async def buy(interaction: discord.Interaction, item: str):
+    with db() as con:
+        product = con.execute("SELECT * FROM shop WHERE item=? COLLATE NOCASE", (item,)).fetchone()
+    if not product:
+        return await reply(interaction, "Had item ma kaynach f shop.")
+    row = get_user(interaction.guild_id, interaction.user.id)
+    if row["wallet"] < product["price"]:
+        return await reply(interaction, "Solde dyalk ma kafich.")
+    with db() as con:
+        con.execute("UPDATE users SET wallet=wallet-? WHERE guild_id=? AND user_id=?",
+                    (product["price"], interaction.guild_id, interaction.user.id))
+        con.execute(
+            "INSERT INTO inventory(guild_id,user_id,item,quantity) VALUES(?,?,?,1) "
+            "ON CONFLICT(guild_id,user_id,item) DO UPDATE SET quantity=quantity+1",
+            (interaction.guild_id, interaction.user.id, product["item"])
+        )
+    await reply(interaction, f"Chriti **{product['item']}** b **{product['price']:,} coins**.")
 
-@bot.tree.command(name="untimeout", description="Fek timeout")
-@app_commands.default_permissions(moderate_members=True)
-@safe(eph=True, perm="moderate_members")
-async def untimeout_cmd(i: discord.Interaction, member: discord.Member):
-    await member.timeout(None)
-    await rep(i, embed=emb(f"T fek timeout 3la {member.mention}"), ephemeral=True)
 
-@bot.tree.command(name="warn", description="Warn")
-@app_commands.default_permissions(moderate_members=True)
-@safe(eph=True, perm="moderate_members")
-async def warn_cmd(i: discord.Interaction, member: discord.Member, reason: str):
-    U(member.id)["warns"].append(dict(reason=reason, by=str(i.user), level=1, time=now()))
-    await rep(i, embed=emb(f"{member.mention} t3ta warn. Total: {len(U(member.id)['warns'])}"), ephemeral=True)
+@bot.tree.command(name="inventory", description="View your purchased items")
+async def inventory(interaction: discord.Interaction, member: discord.Member = None):
+    member = member or interaction.user
+    with db() as con:
+        rows = con.execute(
+            "SELECT item,quantity FROM inventory WHERE guild_id=? AND user_id=? AND quantity>0",
+            (interaction.guild_id, member.id)
+        ).fetchall()
+    desc = "\n".join(f"**{r['item']}** × {r['quantity']}" for r in rows) or "Inventory khawi."
+    await reply(interaction, embed=make_embed(f"Inventory | {member.display_name}", desc), ephemeral=False)
 
-@bot.tree.command(name="warnings", description="Chof warns")
-@app_commands.default_permissions(moderate_members=True)
-@safe(eph=True, perm="moderate_members")
-async def warnings_cmd(i: discord.Interaction, member: discord.Member):
-    w = U(member.id)["warns"]
-    await rep(i, embed=emb(f"Warns dial {member.mention}: {len(w)}"), ephemeral=True)
 
-@bot.tree.command(name="clearwarns", description="Mse7 warns")
-@app_commands.default_permissions(moderate_members=True)
-@safe(eph=True, perm="moderate_members")
-async def clearwarns_cmd(i: discord.Interaction, member: discord.Member):
-    U(member.id)["warns"].clear()
-    await rep(i, embed=emb(f"T mse7o warns dial {member.mention}"), ephemeral=True)
+@bot.tree.command(name="warn", description="Warn a member")
+@app_commands.checks.has_permissions(moderate_members=True)
+async def warn(interaction: discord.Interaction, member: discord.Member, reason: str = "No reason provided"):
+    if member.id == interaction.guild.owner_id or member.top_role >= interaction.user.top_role:
+        return await reply(interaction, "Ma t9drch tdir had action l had member.")
+    with db() as con:
+        con.execute("UPDATE users SET warnings=warnings+1 WHERE guild_id=? AND user_id=?",
+                    (interaction.guild_id, member.id))
+        con.execute(
+            "INSERT INTO warnings(guild_id,user_id,moderator_id,reason,created_at) VALUES(?,?,?,?,?)",
+            (interaction.guild_id, member.id, interaction.user.id, reason[:500], datetime.now(timezone.utc).isoformat())
+        )
+    await reply(interaction, f"{member.mention} t3ta lih warn. Reason: {reason}")
+    await log_mod(interaction.guild, f"{member.mention} warned by {interaction.user.mention}: {reason}")
 
-@bot.tree.command(name="clear", description="Mse7 messages")
-@app_commands.default_permissions(manage_messages=True)
-@safe(eph=True, perm="manage_messages")
-async def clear_cmd(i: discord.Interaction, amount: Literal[5, 10, 20, 50, 100]):
-    deleted = await i.channel.purge(limit=amount)
-    await rep(i, embed=emb(f"T mse7o **{len(deleted)}** message."), ephemeral=True)
 
-@bot.tree.command(name="lock", description="Sed channel")
-@app_commands.default_permissions(manage_channels=True)
-@safe(eph=True, perm="manage_channels")
-async def lock_cmd(i: discord.Interaction, channel: discord.TextChannel = None):
-    ch = channel or i.channel
-    ow = ch.overwrites_for(i.guild.default_role)
-    ow.send_messages = False
-    await ch.set_permissions(i.guild.default_role, overwrite=ow)
-    await rep(i, embed=emb(f"T sedd {ch.mention}"), ephemeral=True)
+async def log_mod(guild, message):
+    channel_id = int(setting("log_channel"))
+    channel = guild.get_channel(channel_id) if channel_id else None
+    if channel:
+        await channel.send(embed=make_embed("Moderation Log", message))
 
-@bot.tree.command(name="unlock", description="7ell channel")
-@app_commands.default_permissions(manage_channels=True)
-@safe(eph=True, perm="manage_channels")
-async def unlock_cmd(i: discord.Interaction, channel: discord.TextChannel = None):
-    ch = channel or i.channel
-    ow = ch.overwrites_for(i.guild.default_role)
-    ow.send_messages = None
-    await ch.set_permissions(i.guild.default_role, overwrite=ow)
-    await rep(i, embed=emb(f"T fte7 {ch.mention}"), ephemeral=True)
 
-@bot.tree.command(name="slowmode", description="Slowmode")
-@app_commands.default_permissions(manage_channels=True)
-@safe(eph=True, perm="manage_channels")
-async def slowmode_cmd(i: discord.Interaction, seconds: Literal[0, 5, 10, 30, 60], channel: discord.TextChannel = None):
-    ch = channel or i.channel
-    await ch.edit(slowmode_delay=seconds)
-    await rep(i, embed=emb(f"Slowmode f {ch.mention}: **{seconds}s**"), ephemeral=True)
+@bot.tree.command(name="warnings", description="View a member's warning count")
+@app_commands.checks.has_permissions(moderate_members=True)
+async def warnings_cmd(interaction: discord.Interaction, member: discord.Member):
+    row = get_user(interaction.guild_id, member.id)
+    await reply(interaction, f"{member.mention} 3ndo **{row['warnings']}** warnings.")
 
-async def post_embed(room, message, color, image, title, ping, btn_text, btn_link):
-    e = emb(message.replace("\\n", "\n"), title=title or TITLE, color=color)
-    if image and image.strip().lower().startswith("http"):
-        e.set_image(url=image.strip())
-    kw = {"embed": e, "allowed_mentions": discord.AllowedMentions(everyone=True)}
-    content = {"everyone": "|| @everyone ||", "here": "|| @here ||"}.get(ping)
-    if content:
-        kw["content"] = content
-    if btn_text and btn_link and btn_link.strip().lower().startswith("http"):
-        v = discord.ui.View()
-        v.add_item(discord.ui.Button(label=btn_text[:80], url=btn_link.strip()))
-        kw["view"] = v
-    return await room.send(**kw)
 
-@bot.tree.command(name="send", description="Sift embed - tahakom kamil - ghir Emrane")
-@safe(eph=True, owner=True, cd=False)
-async def send_cmd(i: discord.Interaction, message: str, room: discord.TextChannel, couleur: str = "e66cb6", image_link: str = None, title: str = "CYBER HEAVEN", ping: Literal['none', 'everyone', 'here'] = 'none', footer: str = None, mention: str = None):
+@bot.tree.command(name="clearwarns", description="Clear a member's warnings")
+@app_commands.checks.has_permissions(administrator=True)
+async def clearwarns(interaction: discord.Interaction, member: discord.Member):
+    with db() as con:
+        con.execute("UPDATE users SET warnings=0 WHERE guild_id=? AND user_id=?",
+                    (interaction.guild_id, member.id))
+        con.execute("DELETE FROM warnings WHERE guild_id=? AND user_id=?",
+                    (interaction.guild_id, member.id))
+    await reply(interaction, f"Tmmsa7o warnings dyal {member.mention}.")
+    await log_mod(interaction.guild, f"Warnings cleared for {member.mention} by {interaction.user.mention}.")
+
+
+@bot.tree.command(name="timeout", description="Timeout a member")
+@app_commands.checks.has_permissions(moderate_members=True)
+async def timeout_cmd(interaction: discord.Interaction, member: discord.Member,
+                      minutes: app_commands.Range[int, 1, 40320], reason: str = "No reason provided"):
+    if member.id == interaction.guild.owner_id or member.top_role >= interaction.user.top_role:
+        return await reply(interaction, "Ma t9drch tdir had action l had member.")
     try:
-        # mention jdid: everyone / here / role / none - y9der ykoun f ping awla mention
-        use_ping = mention if mention in ('everyone','here') else ping
-        # footer jdid: ila 3titi footer, st3mlo, ila la, st3mel default
-        e = emb(message.replace("\\n", "\n"), title=title or "CYBER HEAVEN", color=parse_color(couleur))
-        if image_link and image_link.strip().lower().startswith("http"):
-            e.set_image(url=image_link.strip())
-        e.set_footer(text=footer or "CYBER HEAVEN - Welcome to the family")
-        kw = {"embed": e, "allowed_mentions": discord.AllowedMentions(everyone=True)}
-        if use_ping == "everyone":
-            kw["content"] = "@everyone"
-        elif use_ping == "here":
-            kw["content"] = "@here"
-        elif mention and mention.startswith("<@"):
-            kw["content"] = mention
-        await room.send(**kw)
+        await member.timeout(discord.utils.utcnow() + timedelta(minutes=minutes), reason=reason)
+        await reply(interaction, f"{member.mention} timeout لمدة **{minutes} minutes**.")
+        await log_mod(interaction.guild, f"{member.mention} timeout by {interaction.user.mention}: {reason}")
     except discord.Forbidden:
-        return await fail(i, "Ma 3ndich sla7iya f dak l room - 3ti l bot Send Messages.")
-    except Exception as ex:
-        print(f"[SEND ERROR] {ex!r}")
-        return await fail(i, f"Mochkil f /send: {ex} - jereb bla image_link w bla mention.")
-    await rep(i, embed=emb(f"Sift l message l #{room.name} - mra wahda safi!"), ephemeral=True)
+        await reply(interaction, "Bot ma 3ndoch permission ola role dyalo ta7t target.")
 
-@bot.tree.command(name="send_rules", description="Sift l qawanin - ghir Emrane")
-@safe(eph=True, owner=True, cd=False)
-async def send_rules_cmd(i: discord.Interaction):
-    ch = i.guild.get_channel(get_cfg_channel_id("rules_channel", RULES_CHANNEL_ID))
-    if not ch:
-        return await fail(i, "Ma l9itch channel dial rules.")
-    await ch.send(content="|| @everyone ||", embed=rules_embed(), allowed_mentions=discord.AllowedMentions(everyone=True))
-    await rep(i, embed=emb(f"Sift l qawanin l #{ch.name}"), ephemeral=True)
 
-@bot.tree.command(name="send_welcome", description="Sift welcome - ghir Emrane")
-@safe(eph=True, owner=True, cd=False)
-async def send_welcome_cmd(i: discord.Interaction):
-    ch = i.guild.get_channel(get_cfg_channel_id("welcome_channel", WELCOME_CHANNEL_ID))
-    if not ch:
-        return await fail(i, "Ma l9itch channel dial welcome.")
-    await ch.send(embed=welcome_embed())
-    await rep(i, embed=emb(f"Sift welcome l #{ch.name}"), ephemeral=True)
+@bot.tree.command(name="untimeout", description="Remove a member timeout")
+@app_commands.checks.has_permissions(moderate_members=True)
+async def untimeout(interaction: discord.Interaction, member: discord.Member):
+    if member.id == interaction.guild.owner_id or member.top_role >= interaction.user.top_role:
+        return await reply(interaction, "Ma t9drch tdir had action l had member.")
+    await member.timeout(None, reason=f"Removed by {interaction.user}")
+    await reply(interaction, f"Timeout t7yed mn {member.mention}.")
 
-@bot.tree.command(name="announce", description="Sift i3lan kamil - tahakom 100% - ghir Emrane")
-@safe(eph=True, owner=True, cd=False)
-async def announce_cmd(i: discord.Interaction, message: str, room: discord.TextChannel = None, couleur: str = "e66cb6", image_link: str = None, title: str = "CYBER HEAVEN", mention: str = None, footer: str = None):
-    ch = room or i.channel
+
+@bot.tree.command(name="kick", description="Kick a member")
+@app_commands.checks.has_permissions(kick_members=True)
+async def kick(interaction: discord.Interaction, member: discord.Member, reason: str = "No reason provided"):
+    if member.id == interaction.guild.owner_id or member.top_role >= interaction.user.top_role:
+        return await reply(interaction, "Ma t9drch tdir had action l had member.")
+    await member.kick(reason=reason)
+    await reply(interaction, f"{member} tkhrej mn server.")
+    await log_mod(interaction.guild, f"{member} kicked by {interaction.user.mention}: {reason}")
+
+
+@bot.tree.command(name="ban", description="Ban a member")
+@app_commands.checks.has_permissions(ban_members=True)
+async def ban(interaction: discord.Interaction, member: discord.Member, reason: str = "No reason provided"):
+    if member.id == interaction.guild.owner_id or member.top_role >= interaction.user.top_role:
+        return await reply(interaction, "Ma t9drch tdir had action l had member.")
+    await member.ban(reason=reason)
+    await reply(interaction, f"{member} tban mn server.")
+    await log_mod(interaction.guild, f"{member} banned by {interaction.user.mention}: {reason}")
+
+
+@bot.tree.command(name="clear", description="Delete recent messages")
+@app_commands.checks.has_permissions(manage_messages=True)
+async def clear(interaction: discord.Interaction, amount: app_commands.Range[int, 1, 100]):
+    await interaction.response.defer(ephemeral=True)
+    deleted = await interaction.channel.purge(limit=amount)
+    await interaction.followup.send(f"Tmmsa7o **{len(deleted)}** messages.", ephemeral=True)
+
+
+@bot.tree.command(name="serverinfo", description="Show server information")
+async def serverinfo(interaction: discord.Interaction):
+    guild = interaction.guild
+    embed = make_embed(f"Server | {guild.name}")
+    embed.add_field(name="Members", value=str(guild.member_count))
+    embed.add_field(name="Roles", value=str(len(guild.roles)))
+    embed.add_field(name="Channels", value=str(len(guild.channels)))
+    if guild.icon:
+        embed.set_thumbnail(url=guild.icon.url)
+    await reply(interaction, embed=embed, ephemeral=False)
+
+
+@bot.tree.command(name="setup", description="Set a bot channel")
+@owner_only()
+@app_commands.choices(kind=[
+    app_commands.Choice(name="Logs", value="log_channel"),
+    app_commands.Choice(name="Level Ups", value="level_channel"),
+    app_commands.Choice(name="Welcome", value="welcome_channel"),
+    app_commands.Choice(name="Rules", value="rules_channel"),
+])
+async def setup(interaction: discord.Interaction, kind: app_commands.Choice[str], channel: discord.TextChannel):
+    set_setting(kind.value, channel.id)
+    await reply(interaction, f"{kind.name} room t3ayen: {channel.mention}")
+
+
+@bot.tree.command(name="config", description="Show current bot configuration")
+@owner_only()
+async def config(interaction: discord.Interaction):
+    keys = ["server_name", "level_channel", "welcome_channel", "rules_channel", "log_channel",
+            "xp_min", "xp_max", "voice_xp", "daily_min", "daily_max", "level_roles"]
+    desc = "\n".join(f"**{key}**: `{setting(key)}`" for key in keys)
+    await reply(interaction, embed=make_embed("Configuration", desc))
+
+
+@bot.tree.command(name="set_embed_color", description="Change embed color using a hex value")
+@owner_only()
+async def set_embed_color(interaction: discord.Interaction, hex_color: str):
     try:
-        e = emb(message.replace("\\n", "\n"), title=title or "CYBER HEAVEN", color=parse_color(couleur))
-        if image_link and image_link.strip().lower().startswith("http"):
-            e.set_image(url=image_link.strip())
-        e.set_footer(text=footer or "CYBER HEAVEN - Welcome to the family")
-        kw = {"embed": e, "allowed_mentions": discord.AllowedMentions(everyone=True)}
-        if mention == "everyone":
-            kw["content"] = "@everyone"
-        elif mention == "here":
-            kw["content"] = "@here"
-        elif mention and mention.startswith("<@"):
-            kw["content"] = mention
-        await ch.send(**kw)
-    except Exception as ex:
-        print(f"[ANNOUNCE ERROR] {ex!r}")
-        return await fail(i, f"Mochkil f /announce: {ex}")
-    await rep(i, embed=emb(f"Sift l i3lan l #{ch.name}"), ephemeral=True)
+        value = int(hex_color.strip().replace("#", "").replace("0x", ""), 16)
+        if not 0 <= value <= 0xFFFFFF:
+            raise ValueError
+    except ValueError:
+        return await reply(interaction, "Color khaso ykon HEX b7al #E66CB6.")
+    set_setting("embed_color", value)
+    await reply(interaction, f"Embed color تبدل لـ `#{value:06X}`.")
 
-@bot.tree.command(name="setup", description="7ded channel - ghir Emrane f ay server")
-@safe(eph=True, owner=True, cd=False)
-async def setup_cmd(i: discord.Interaction, type: Literal['log', 'starboard', 'suggest', 'staff', 'level_channel', 'welcome_channel', 'rules_channel'], channel: discord.TextChannel):
-    cfg[type] = channel.id
-    names = {"level_channel": "Level Up", "welcome_channel": "Welcome", "rules_channel": "Rules", "log": "Log", "starboard": "Starboard", "suggest": "Suggest", "staff": "Staff"}
-    await rep(i, embed=emb(f"Channel dial **{names.get(type, type)}** daba howa {channel.mention}"), ephemeral=True)
 
-@bot.tree.command(name="level_room", description="7ded room dial level-up - ghir Emrane")
-@safe(eph=True, owner=True, cd=False)
-async def level_room_cmd(i: discord.Interaction, channel: discord.TextChannel):
-    cfg["level_channel"] = channel.id
-    await rep(i, embed=emb(f"Room dial Level-Up daba howa {channel.mention} - f had l server"), ephemeral=True)
+@bot.tree.command(name="set_title", description="Change the default embed title")
+@owner_only()
+async def set_title(interaction: discord.Interaction, title: str):
+    set_setting("embed_title", title[:256])
+    await reply(interaction, "Default embed title تبدل.")
 
-@bot.tree.command(name="welcome_room", description="7ded room dial welcome - ghir Emrane")
-@safe(eph=True, owner=True, cd=False)
-async def welcome_room_cmd(i: discord.Interaction, channel: discord.TextChannel):
-    cfg["welcome_channel"] = channel.id
-    await rep(i, embed=emb(f"Room dial Welcome daba howa {channel.mention}"), ephemeral=True)
 
-@bot.tree.command(name="ticket", description="7el ticket")
-@safe(eph=True)
-async def ticket_cmd(i: discord.Interaction, reason: Literal['support', 'report', 'suggestion', 'other'] = 'support'):
-    for cid, t in tickets.items():
-        if t["owner"] == i.user.id and i.guild.get_channel(cid):
-            return await fail(i, f"3ndek ticket deja: <#{cid}>")
-    ow = {i.guild.default_role: discord.PermissionOverwrite(view_channel=False), i.user: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True), i.guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True)}
-    name = re.sub(r"[^a-z0-9-]", "", i.user.name.lower()) or str(i.user.id)
-    ch = await i.guild.create_text_channel(f"ticket-{name}", overwrites=ow, category=i.channel.category)
-    tickets[ch.id] = {"owner": i.user.id, "claimed": None}
-    await ch.send(content=i.user.mention, embed=emb(f"Mar7ba bik {i.user.mention}!\nSabab: **{reason}**"))
-    await rep(i, embed=emb(f"T7ell ticket dialk: {ch.mention}"), ephemeral=True)
+@bot.tree.command(name="set_footer", description="Change the default embed footer")
+@owner_only()
+async def set_footer(interaction: discord.Interaction, footer: str):
+    set_setting("footer", footer[:2048])
+    await reply(interaction, "Default embed footer تبدل.")
 
-@bot.tree.command(name="close_ticket", description="Sed ticket")
-@safe(eph=True)
-async def close_ticket_cmd(i: discord.Interaction):
-    t = tickets.get(i.channel.id)
-    if not t:
-        return await fail(i, "Hada machi ticket.")
-    tickets.pop(i.channel.id, None)
-    await i.channel.delete(reason="Ticket closed")
 
-@bot.tree.command(name="add_user", description="Zid member l ticket")
-@safe(eph=True)
-async def add_user_cmd(i: discord.Interaction, member: discord.Member):
-    await i.channel.set_permissions(member, view_channel=True, send_messages=True, read_message_history=True)
-    await rep(i, embed=emb(f"T zad {member.mention} l ticket."), ephemeral=True)
+@bot.tree.command(name="set_server_name", description="Change the server label shown in embeds")
+@owner_only()
+async def set_server_name(interaction: discord.Interaction, name: str):
+    set_setting("server_name", name[:100])
+    await reply(interaction, "Server label تبدل.")
 
-@bot.tree.command(name="giveaway", description="Dir giveaway")
-@app_commands.default_permissions(manage_guild=True)
-@safe(eph=True, perm="manage_guild")
-async def giveaway_cmd(i: discord.Interaction, prize: str, duration_minutes: Literal[5, 15, 60, 1440], winners: Literal[1, 2, 3] = 1):
-    await rep(i, embed=emb(f"Giveaway lanca! Prize: **{prize}** - {winners} winner(s) - {duration_minutes} min"), ephemeral=True)
 
-@bot.tree.command(name="poll", description="Dir sondage")
-@app_commands.default_permissions(manage_messages=True)
-@safe(eph=True, perm="manage_messages")
-async def poll_cmd(i: discord.Interaction, question: str, option1: str, option2: str):
-    await rep(i, embed=emb(f"**POLL**\n{question}\n\n1. {option1}\n2. {option2}"), ephemeral=True)
+@bot.tree.command(name="set_xp_rate", description="Set message XP range")
+@owner_only()
+async def set_xp_rate(interaction: discord.Interaction, minimum: app_commands.Range[int, 1, 100],
+                      maximum: app_commands.Range[int, 1, 100]):
+    if minimum > maximum:
+        return await reply(interaction, "Minimum khaso ykon sghar mn maximum.")
+    set_setting("xp_min", minimum)
+    set_setting("xp_max", maximum)
+    await reply(interaction, f"Message XP: **{minimum}-{maximum}**.")
 
-@bot.tree.command(name="counting_setup", description="Counting game")
-@app_commands.default_permissions(manage_channels=True)
-@safe(eph=True, perm="manage_channels")
-async def counting_setup_cmd(i: discord.Interaction, channel: discord.TextChannel):
-    counting["channel"] = channel.id
-    counting["current"] = 0
-    await channel.send(embed=emb("**Counting game!** Bda t3ed mn **1**."))
-    await rep(i, embed=emb(f"Counting f {channel.mention} bda!"), ephemeral=True)
 
-@bot.tree.command(name="suggest", description="Sift fikra")
-@safe(eph=True)
-async def suggest_cmd(i: discord.Interaction, idea: str):
-    ch = chan(i.guild, "suggest", ("suggestions", "suggestion")) or i.channel
-    await ch.send(embed=emb(f"**Suggestion jdida**\n\n{idea}", fields=[("Mn 3end", i.user.mention)]))
-    await rep(i, embed=emb(f"Sift l fikra dialk l {ch.mention}"), ephemeral=True)
+@bot.tree.command(name="set_voice_xp", description="Set XP per active voice minute")
+@owner_only()
+async def set_voice_xp(interaction: discord.Interaction, amount: app_commands.Range[int, 0, 500]):
+    set_setting("voice_xp", amount)
+    await reply(interaction, f"Voice XP تبدل لـ **{amount}** per minute.")
 
-@bot.tree.command(name="report", description="Report b secret")
-@safe(eph=True)
-async def report_cmd(i: discord.Interaction, member: discord.Member, reason: str):
-    ch = chan(i.guild, "staff", ("staff", "reports", "report")) or i.channel
-    await ch.send(embed=emb("**Report jdid**", fields=[("Member", f"{member.mention}"), ("Sabab", reason, False)]))
-    await rep(i, embed=emb("Sift l report l staff."), ephemeral=True)
 
-@bot.tree.command(name="remind", description="Tfkerni")
-@safe(eph=True)
-async def remind_cmd(i: discord.Interaction, time: Literal['10min', '1h', '1day'], message: str):
-    await rep(i, embed=emb(f"Ghadi nfkrek mn b3d **{time}**: {message}"), ephemeral=True)
-
-@bot.tree.command(name="banner", description="Chof banner")
-@safe()
-async def banner_cmd(i: discord.Interaction, member: discord.Member = None):
-    m = member or i.user
-    u = await bot.fetch_user(m.id)
-    if not u.banner:
-        return await fail(i, "Ma 3ndoch banner.")
-    await rep(i, embed=emb(f"Banner dial {m.mention}", image=u.banner.url))
-
-@bot.tree.command(name="addxp", description="Zid XP l chi wa7ed (ghir mol server)")
-@app_commands.default_permissions(administrator=True)
-@safe(eph=True, owner=True, cd=False)
-async def addxp_cmd(i: discord.Interaction, member: discord.Member, amount: app_commands.Range[int, 1, 100000]):
-    await add_xp(member, amount, i.channel)
-    u = U(member.id)
-    await rep(i, embed=emb(f"Zdt **{amount}** XP l {member.mention}\nDaba Level: **{u['level']}** | XP: **{u['xp']}**"), ephemeral=True)
-
-@bot.tree.command(name="setlevel", description="Beddel level dial chi wa7ed (ghir mol server)")
-@app_commands.default_permissions(administrator=True)
-@safe(eph=True, owner=True, cd=False)
-async def setlevel_cmd(i: discord.Interaction, member: discord.Member, level: app_commands.Range[int, 1, 100]):
-    u = U(member.id)
-    u["level"] = level
-    u["xp"] = 0
-    await sync_level_roles(member, level)
-    await rep(i, embed=emb(f"Level dial {member.mention} daba **{level}**"), ephemeral=True)
-
-@bot.tree.command(name="voice_setup", description="7ded room dial sot li ib9a fih l bot 24/24")
-@app_commands.default_permissions(administrator=True)
-@safe(eph=True, owner=True, cd=False)
-async def voice_setup_cmd(i: discord.Interaction, channel: discord.VoiceChannel, mode: Literal['on', 'off'] = 'on'):
-    cfg["voice_channel"] = channel.id
-    cfg["voice_247"] = (mode == 'on')
-    if mode == 'on':
-        await join_voice_247(i.guild)
-        await rep(i, embed=emb(f"Bot daba ghadi ib9a f **{channel.mention}** 24/24"), ephemeral=True)
-    else:
-        if i.guild.voice_client:
-            await i.guild.voice_client.disconnect()
-        await rep(i, embed=emb(f"Mode 24/24 tfa, bot khrej mn sot."), ephemeral=True)
-
-@bot.tree.command(name="join", description="Dkhel l bot l room dial sot dialk")
-@safe(eph=True)
-async def join_cmd(i: discord.Interaction):
-    if not i.user.voice or not i.user.voice.channel:
-        return await fail(i, "Dkhel l chi room dial sot lwl 3ad 3ayt l bot.")
-    ch = i.user.voice.channel
+@bot.tree.command(name="set_level_roles", description="Set level role mapping")
+@owner_only()
+async def set_level_roles(interaction: discord.Interaction, mapping: str):
+    # Format example: 1:Newcomer,5:Active,10:Elite,20:Legend,30:Mythic
     try:
-        if i.guild.voice_client and i.guild.voice_client.is_connected():
-            await i.guild.voice_client.move_to(ch)
+        parts = mapping.split(",")
+        parsed = {}
+        for part in parts:
+            level, name = part.split(":", 1)
+            parsed[int(level.strip())] = name.strip()
+        if not parsed or any(level < 1 or not name for level, name in parsed.items()):
+            raise ValueError
+    except ValueError:
+        return await reply(interaction, "Format: `1:Newcomer,5:Active,10:Elite,20:Legend,30:Mythic`")
+    set_setting("level_roles", ",".join(f"{k}:{v}" for k, v in sorted(parsed.items())))
+    await reply(interaction, "Level roles mapping تبدل. T2kked roles kaynin f server.")
+
+
+@bot.tree.command(name="set_welcome_message", description="Change the welcome message")
+@owner_only()
+async def set_welcome_message(interaction: discord.Interaction, message: str):
+    set_setting("welcome_text", message[:1800])
+    await reply(interaction, "Welcome message تبدل. Variables: `{server}` و `{user}`.")
+
+
+@bot.tree.command(name="set_rules", description="Change the server rules text")
+@owner_only()
+async def set_rules(interaction: discord.Interaction, text: str):
+    set_setting("rules_text", text[:3500])
+    await reply(interaction, "Rules text تبدل.")
+
+
+@bot.tree.command(name="set_daily_amount", description="Set daily reward range")
+@owner_only()
+async def set_daily_amount(interaction: discord.Interaction, minimum: app_commands.Range[int, 0, 100000],
+                           maximum: app_commands.Range[int, 0, 100000]):
+    if minimum > maximum:
+        return await reply(interaction, "Minimum khaso ykon sghar mn maximum.")
+    set_setting("daily_min", minimum)
+    set_setting("daily_max", maximum)
+    await reply(interaction, f"Daily reward range: **{minimum}-{maximum}**.")
+
+
+@bot.tree.command(name="level_room", description="Set the level-up channel")
+@owner_only()
+async def level_room(interaction: discord.Interaction, channel: discord.TextChannel):
+    set_setting("level_channel", channel.id)
+    await reply(interaction, f"Level-up room: {channel.mention}")
+
+
+@bot.tree.command(name="welcome_room", description="Set the welcome channel")
+@owner_only()
+async def welcome_room(interaction: discord.Interaction, channel: discord.TextChannel):
+    set_setting("welcome_channel", channel.id)
+    await reply(interaction, f"Welcome room: {channel.mention}")
+
+
+@bot.tree.command(name="addxp", description="Give XP to a member")
+@owner_only()
+async def addxp(interaction: discord.Interaction, member: discord.Member,
+                amount: app_commands.Range[int, 1, 100000]):
+    await add_xp(member, amount)
+    await reply(interaction, f"Zedna **{amount} XP** l {member.mention}.")
+
+
+@bot.tree.command(name="setlevel", description="Set a member level")
+@owner_only()
+async def setlevel(interaction: discord.Interaction, member: discord.Member,
+                   level: app_commands.Range[int, 0, 500]):
+    with db() as con:
+        con.execute("UPDATE users SET level=?,xp=0 WHERE guild_id=? AND user_id=?",
+                    (level, interaction.guild_id, member.id))
+    await update_level_role(member)
+    await reply(interaction, f"Level dyal {member.mention} wla **{level}**.")
+
+
+@bot.tree.command(name="send", description="Send one custom embed to a channel")
+@owner_only()
+async def send(interaction: discord.Interaction, channel: discord.TextChannel, message: str,
+               title: str = None, image_link: str = None, mention: str = "none"):
+    if mention not in ("none", "everyone", "here"):
+        return await reply(interaction, "Mention choices: none, everyone, here.")
+    embed = make_embed(title, message)
+    if image_link:
+        embed.set_image(url=image_link)
+    content = "@everyone" if mention == "everyone" else "@here" if mention == "here" else None
+    await channel.send(content=content, embed=embed, allowed_mentions=discord.AllowedMentions(everyone=(mention != "none")))
+    await reply(interaction, f"Message tsift l {channel.mention}.")
+
+
+@bot.tree.command(name="announce", description="Publish a server announcement")
+@owner_only()
+async def announce(interaction: discord.Interaction, channel: discord.TextChannel, message: str,
+                   title: str = "Announcement", image_link: str = None):
+    embed = make_embed(title, message)
+    if image_link:
+        embed.set_image(url=image_link)
+    await channel.send(embed=embed)
+    await reply(interaction, f"Announcement tsift l {channel.mention}.")
+
+
+@bot.tree.command(name="send_rules", description="Publish configured server rules")
+@owner_only()
+async def send_rules(interaction: discord.Interaction):
+    channel_id = int(setting("rules_channel"))
+    channel = interaction.guild.get_channel(channel_id) if channel_id else None
+    if not channel:
+        return await reply(interaction, "3ayen rules room b /setup.")
+    await channel.send(embed=make_embed("Server Rules", setting("rules_text")))
+    await reply(interaction, f"Rules tsifto l {channel.mention}.")
+
+
+@bot.tree.command(name="send_welcome", description="Publish the welcome information")
+@owner_only()
+async def send_welcome(interaction: discord.Interaction):
+    channel_id = int(setting("welcome_channel"))
+    channel = interaction.guild.get_channel(channel_id) if channel_id else None
+    if not channel:
+        return await reply(interaction, "3ayen welcome room b /setup.")
+    text = setting("welcome_text").replace("{server}", interaction.guild.name).replace("{user}", "everyone")
+    await channel.send(embed=make_embed("Welcome to CYBER HEAVEN", text))
+    await reply(interaction, f"Welcome embed tsift l {channel.mention}.")
+
+
+@bot.tree.command(name="voice_setup", description="Connect bot to a voice channel")
+@owner_only()
+async def voice_setup(interaction: discord.Interaction, channel: discord.VoiceChannel):
+    await interaction.response.defer(ephemeral=True)
+    try:
+        if interaction.guild.voice_client:
+            await interaction.guild.voice_client.move_to(channel)
         else:
-            await ch.connect(self_deaf=True, self_mute=False)
-        await rep(i, embed=emb(f"Dkhlt l **{ch.name}**"), ephemeral=True)
-    except Exception as ex:
-        await fail(i, f"Ma9dertch ndkhol: {ex}")
+            await channel.connect(self_deaf=True)
+        set_setting("voice_channel", channel.id)
+        set_setting("voice_24_7", 1)
+        await interaction.followup.send(f"Bot dkhel l {channel.mention}. Mode 24/24 activé.", ephemeral=True)
+    except (discord.Forbidden, discord.ClientException) as exc:
+        await interaction.followup.send(f"Ma 9drtch ndkhol: {exc}", ephemeral=True)
 
-@bot.tree.command(name="leave", description="Khrej l bot mn sot")
-@safe(eph=True)
-async def leave_cmd(i: discord.Interaction):
-    cfg["voice_247"] = False
-    if i.guild.voice_client:
-        await i.guild.voice_client.disconnect()
-        await rep(i, embed=emb("Khrjt mn sot."), ephemeral=True)
+
+@bot.tree.command(name="leave_voice", description="Disconnect bot from voice")
+@owner_only()
+async def leave_voice(interaction: discord.Interaction):
+    set_setting("voice_24_7", 0)
+    set_setting("voice_channel", 0)
+    voice = interaction.guild.voice_client
+    if voice:
+        await voice.disconnect(force=True)
+    await reply(interaction, "Bot khrej mn voice w mode 24/24 t7yed.")
+
+
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.CheckFailure):
+        message = str(error) or "Ma 3ndkch permission l had command."
+    elif isinstance(error, app_commands.MissingPermissions):
+        message = "Ma 3ndkch permissions kafiin l had command."
     else:
-        await fail(i, "Ma kanch f sot.")
-
-
-@bot.tree.command(name="set_title", description="Beddel l3onwan dial embeds - ghir Emrane")
-@safe(eph=True, owner=True, cd=False)
-async def set_title_cmd(i: discord.Interaction, title: str):
-    global TITLE
-    TITLE = title
-    await rep(i, embed=emb(f"L3onwan daba: **{title}**"), ephemeral=True)
-
-@bot.tree.command(name="set_footer", description="Beddel smiya li f lteht - ghir Emrane")
-@safe(eph=True, owner=True, cd=False)
-async def set_footer_cmd(i: discord.Interaction, footer: str):
-    global FOOTER
-    FOOTER = footer
-    await rep(i, embed=emb(f"Footer daba: **{footer}**"), ephemeral=True)
-
-@bot.tree.command(name="set_server_name", description="Beddel smiya dial server f embeds - ghir Emrane")
-@safe(eph=True, owner=True, cd=False)
-async def set_server_name_cmd(i: discord.Interaction, name: str):
-    global TITLE
-    TITLE = name
-    await rep(i, embed=emb(f"Smiya dial server daba: **{name}**"), ephemeral=True)
-
-@bot.tree.command(name="set_embed_color", description="Beddel lon dial embeds - ghir Emrane")
-@safe(eph=True, owner=True, cd=False)
-async def set_embed_color_cmd(i: discord.Interaction, color: str):
-    global PINK
-    PINK = parse_color(color)
-    await rep(i, embed=emb(f"Lon daba: **{color}**"), ephemeral=True)
-
-import discord
-from discord.ext import commands
-import json
-import random
-import os
-
-bot = commands.Bot(command_prefix="!", intents=discord.Intents.all())
-
-# --- اللوت هو هو لكلشي ---
-LOOT = [
-    "🗡️ سيف أسطوري",
-    "🛡️ درع ذهبي",
-    "💎 جوهرة نادرة",
-    "🧪 جرعة سحرية",
-    "🏹 قوس الصياد",
-    "💰 1000 كوينز"
-]
-
-# --- ملف التصاور ---
-FILE = "server_images.json"
-
-def load_images():
-    if not os.path.exists(FILE):
-        return {}
-    with open(FILE, "r") as f:
-        return json.load(f)
-
-def save_images(data):
-    with open(FILE, "w") as f:
-        json.dump(data, f, indent=4)
-
-# تصويرة افتراضية إلا السيرفر مازال ما حطش ديالو
-DEFAULT_IMAGE = "https://i.imgur.com/EXEMPLE.png"
-
-@bot.command()
-async def loot(ctx):
-    item = random.choice(LOOT)
-    images = load_images()
-    # كنجيبو التصويرة ديال هاد السيرفر بالضبط
-    image_url = images.get(str(ctx.guild.id), DEFAULT_IMAGE)
-
-    embed = discord.Embed(title="🎁 اللوت ديالك!", description=f"ربحتي: **{item}**", color=0xFFD700)
-    embed.set_image(url=image_url)
-    embed.set_footer(text=f"سيرفر: {ctx.guild.name}")
-    await ctx.send(embed=embed)
-
-@bot.command()
-@commands.has_permissions(administrator=True)
-async def setimage(ctx, link: str):
-    images = load_images()
-    images[str(ctx.guild.id)] = link
-    save_images(images)
-    await ctx.send(f"✅ صافي، التصويرة ديال هاد السيرفر تبدلات!\n{link}")
-
-@bot.command()
-async def myimage(ctx):
-    images = load_images()
-    image_url = images.get(str(ctx.guild.id), DEFAULT_IMAGE)
-    await ctx.send(f"التصويرة ديال هاد السيرفر هي:\n{image_url}")
-
-
-TOKEN = os.getenv("TOKEN")
-if not TOKEN:
-    print("TOKEN makaynch f Railway Variables!")
-else:
+        log.exception("Slash command error", exc_info=error)
+        message = "Twa9e3 error. T9yd f logs dyal bot."
     try:
-        bot.run(TOKEN)
-    except discord.LoginFailure:
-        print("Token ghalet")
+        await reply(interaction, message)
+    except discord.HTTPException:
+        pass
+
+
+if __name__ == "__main__":
+    if not TOKEN:
+        raise RuntimeError("TOKEN environment variable is missing.")
+    if not GUILD_ID:
+        raise RuntimeError("GUILD_ID environment variable is missing.")
+    bot.run(TOKEN)
