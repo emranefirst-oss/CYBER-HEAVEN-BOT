@@ -9,9 +9,11 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 
-# CYBER HEAVEN - single-server Discord bot
+# CYBER HEAVEN - multi-server Discord bot
 TOKEN = os.getenv("TOKEN")
-GUILD_ID = int(os.getenv("GUILD_ID", "0"))
+_raw_guild_ids = os.getenv("GUILD_IDS", os.getenv("GUILD_ID", ""))
+GUILD_IDS = {int(value.strip()) for value in _raw_guild_ids.split(",") if value.strip().isdigit()}
+
 OWNER_ID = 1396590553420005437
 DB_PATH = os.getenv("DB_PATH", "cyber_heaven.db")
 
@@ -215,12 +217,13 @@ async def add_xp(member, amount):
 class CyberBot(commands.Bot):
     async def setup_hook(self):
         init_db()
-        if not GUILD_ID:
-            raise RuntimeError("Set GUILD_ID in Railway Variables to lock the bot to its official server.")
-        guild = discord.Object(id=GUILD_ID)
-        self.tree.copy_global_to(guild=guild)
-        synced = await self.tree.sync(guild=guild)
-        log.info("Synced %s slash commands to guild %s", len(synced), GUILD_ID)
+        if not GUILD_IDS:
+            raise RuntimeError("Set GUILD_IDS in Railway Variables (comma-separated server IDs).")
+        for guild_id in sorted(GUILD_IDS):
+            guild = discord.Object(id=guild_id)
+            self.tree.copy_global_to(guild=guild)
+            synced = await self.tree.sync(guild=guild)
+            log.info("Synced %s slash commands to guild %s", len(synced), guild_id)
         voice_xp_loop.start()
 
 
@@ -242,18 +245,19 @@ async def on_ready():
 
 
 async def reconnect_saved_voice():
-    if not GUILD_ID or setting("voice_24_7") != "1":
+    if setting("voice_24_7") != "1":
         return
-    guild = bot.get_guild(GUILD_ID)
     channel_id = int(setting("voice_channel"))
-    channel = guild.get_channel(channel_id) if guild and channel_id else None
-    if not isinstance(channel, discord.VoiceChannel) or guild.voice_client:
-        return
-    try:
-        await channel.connect(self_deaf=True)
-        log.info("Reconnected to saved voice channel %s", channel.id)
-    except (discord.Forbidden, discord.ClientException) as exc:
-        log.warning("Voice reconnect failed: %s", exc)
+    for guild_id in GUILD_IDS:
+        guild = bot.get_guild(guild_id)
+        channel = guild.get_channel(channel_id) if guild and channel_id else None
+        if not isinstance(channel, discord.VoiceChannel) or guild.voice_client:
+            continue
+        try:
+            await channel.connect(self_deaf=True)
+            log.info("Reconnected to saved voice channel %s in guild %s", channel.id, guild.id)
+        except (discord.Forbidden, discord.ClientException) as exc:
+            log.warning("Voice reconnect failed in guild %s: %s", guild_id, exc)
 
 
 @bot.event
@@ -268,7 +272,7 @@ async def on_voice_state_update(member, before, after):
 
 @bot.event
 async def on_message(message):
-    if message.author.bot or not message.guild or message.guild.id != GUILD_ID:
+    if message.author.bot or not message.guild or message.guild.id not in GUILD_IDS:
         return
     low = message.content.lower()
     if "discord.gg/" in low or "discord.com/invite/" in low:
@@ -291,7 +295,7 @@ async def on_message(message):
 
 @bot.event
 async def on_member_join(member):
-    if member.guild.id != GUILD_ID:
+    if member.guild.id not in GUILD_IDS:
         return
     role_id = int(setting("auto_role"))
     role = member.guild.get_role(role_id) if role_id else None
@@ -313,7 +317,7 @@ async def on_member_join(member):
 
 @bot.event
 async def on_member_remove(member):
-    if member.guild.id != GUILD_ID:
+    if member.guild.id not in GUILD_IDS:
         return
     log_id = int(setting("log_channel"))
     channel = member.guild.get_channel(log_id) if log_id else None
@@ -324,7 +328,7 @@ async def on_member_remove(member):
 @tasks.loop(seconds=60)
 async def voice_xp_loop():
     for guild in bot.guilds:
-        if guild.id != GUILD_ID:
+        if guild.id not in GUILD_IDS:
             continue
         for voice in guild.voice_channels:
             for member in voice.members:
@@ -879,6 +883,6 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
 if __name__ == "__main__":
     if not TOKEN:
         raise RuntimeError("TOKEN environment variable is missing.")
-    if not GUILD_ID:
-        raise RuntimeError("GUILD_ID environment variable is missing.")
+    if not GUILD_IDS:
+        raise RuntimeError("GUILD_IDS environment variable is missing. Add both server IDs separated by a comma.")
     bot.run(TOKEN)
